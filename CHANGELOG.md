@@ -1,11 +1,18 @@
 # Changelog
 
+## 1.1.0 - 2026-10-05
+
+- 动态发现聊天 provider，支持文字/视觉模型选择、兼容旧 ID 和失败降级。
+- 新增好友申请、群邀请图片审核卡片，显示评分算式与明确建议结论。
+- 好友和群邀请独立阈值，单项开关/上限/提示词；硬规则跳过不再显示满分。
+- 好友列表和群列表使用完整长图，超长列表自动拆图，保留连续序号。
+- 新增退群、删好友、增减审批员和 10 分钟列表快照。
+- 新增被踢后拉黑操作者与群聊，独立开关、来源持久化和通知回退。
+- 加固引用审批的会话归属、并发去重、重启恢复和执行前黑名单检查。
+- 随包提供 Noto Sans CJK SC 字体与 OFL 许可文件。
+
+升级说明：旧历史、计数与黑名单保留；缺少机器人/会话信息的旧待审批消息需重新申请。
+
 ## 1.0.0 - 2026-10-05
 
-- Added automatic and semi-automatic review for friend requests and group invitations.
-- Added configurable scoring for request text, profile fields, QQ levels, avatars, group data, notices, and essence messages.
-- Added AstrBot text and vision model integration with JSON score validation and graceful fallback.
-- Added quoted-message approval commands: `同意`, `拒绝`, and `拉黑`.
-- Added persistent pending reviews, review history, rejection counts, and local blacklist handling.
-- Added text and image review reports for configured review sessions.
-
+- 支持全自动/半自动好友申请与群邀请审核、资料评分、引用审批及持久化。

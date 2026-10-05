@@ -18,11 +18,14 @@ class JsonStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             return value
         except (OSError, ValueError, TypeError):
-            return self.default.copy() if isinstance(self.default, dict) else self.default
+            return (
+                self.default.copy() if isinstance(self.default, dict) else self.default
+            )
 
     def save(self, value: Any) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         os.replace(tmp, self.path)
-

@@ -81,7 +81,9 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
             return None
 
 
-def score_level(level: Any, threshold: int, high_threshold: int, one: int, two: int) -> int:
+def score_level(
+    level: Any, threshold: int, high_threshold: int, one: int, two: int
+) -> int:
     value = as_int(level)
     if value >= high_threshold:
         return max(0, two)
@@ -102,4 +104,3 @@ def score_range(value: Any, minimum: int, maximum: int, points: int) -> int:
 def format_value(value: Any, fallback: str = "未知") -> str:
     text = as_text(value)
     return text if text else fallback
-

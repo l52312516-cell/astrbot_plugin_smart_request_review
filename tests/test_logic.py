@@ -17,7 +17,7 @@ class LogicTests(unittest.TestCase):
     def test_clamp_and_json(self):
         self.assertEqual(clamp_score(9, 2), 2)
         self.assertEqual(clamp_score(-1, 2), 0)
-        self.assertEqual(parse_json_object("```json\n{\"score\": 2}\n```"), {"score": 2})
+        self.assertEqual(parse_json_object('```json\n{"score": 2}\n```'), {"score": 2})
         self.assertIsNone(parse_json_object("not json"))
 
     def test_keywords_and_score_boundaries(self):
@@ -38,4 +38,3 @@ class LogicTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
