@@ -33,6 +33,7 @@ from .core.logic import (
     unwrap_data,
 )
 from .core.providers import ProviderSelector
+from .core.routing import AccountClient
 from .core.profiles import meaningful, merge_group
 
 try:
@@ -190,12 +191,17 @@ class SmartRequestReview(Star):
             bot_id = str(event.get_self_id())
         except Exception:
             bot_id = str(raw_event(event).get("self_id") or "")
+        if not bot_id.isdigit() or int(bot_id) <= 0:
+            bot_id = str(raw_event(event).get("self_id") or "")
         try:
             platform_id = str(event.get_platform_id())
         except (AttributeError, TypeError):
             umo = str(getattr(event, "unified_msg_origin", "") or "")
             platform_id = umo.rsplit(":", 2)[0] if ":" in umo else "aiocqhttp"
         return bot_id, platform_id
+
+    def _event_bot(self, event):
+        return AccountClient(event.bot, self._identity(event)[0])
 
     def _event_target(self, event):
         group_id = str(event.get_group_id() or "")
@@ -810,6 +816,8 @@ class SmartRequestReview(Star):
         lines = [
             f"【{'好友申请' if record['kind'] == 'friend' else '群聊邀请'}】{outcome}"
         ]
+        if record.get("bot_id"):
+            lines.append(f"受理机器人：{self._display_id(record['bot_id'])}")
         if record["kind"] == "group":
             if name("name"):
                 lines.append(f"群名称：{name('name')}")
@@ -887,18 +895,39 @@ class SmartRequestReview(Star):
         sent = []
         for target in self._review_targets():
             mid = await self._send_segments(
-                event.bot, target, brief if image else full, image, fallback_text=full
+                self._event_bot(event),
+                target,
+                brief if image else full,
+                image,
+                fallback_text=full,
             )
             if mid:
                 sent.append((target, mid))
         if not sent:
-            logger.warning(f"[{PLUGIN_NAME}] 未向管理员投递审核报告")
+            attempted = set(self._review_targets())
+            for uid in sorted(self.admin_users() | self.astrbot_admins()):
+                target = f"private:{uid}"
+                if not uid.isdigit() or target in attempted:
+                    continue
+                mid = await self._send_segments(
+                    self._event_bot(event),
+                    target,
+                    brief if image else full,
+                    image,
+                    fallback_text=full,
+                )
+                if mid:
+                    sent.append((target, mid))
+        if not sent:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 审核通知全部失败：bot/platform={self._identity(event)}，请确认该账号能向审核群或审批员发送消息"
+            )
         return sent
 
     async def _notify_requester(self, event, record, text):
         if self.cfg("requester_notice", True):
             await self._send_segments(
-                event.bot, f"private:{record['subject_id']}", text
+                self._event_bot(event), f"private:{record['subject_id']}", text
             )
 
     def _persist_history(self, record, outcome, operator="auto", error=""):
@@ -929,6 +958,9 @@ class SmartRequestReview(Star):
         ):
             return
         bot_id, platform_id = self._identity(event)
+        logger.info(
+            f"[{PLUGIN_NAME}] 收到{kind}申请：bot={bot_id}, platform={platform_id}"
+        )
         record = {
             "kind": kind,
             "subject_id": user_id,
@@ -954,11 +986,13 @@ class SmartRequestReview(Star):
             self.providers.refresh()
             comment = as_text(raw.get("comment"))
             if kind == "friend":
-                p = await self._friend_profile(event.bot, user_id, comment)
+                p = await self._friend_profile(self._event_bot(event), user_id, comment)
                 record["profile"] = {k: v for k, v in p.items() if k != "avatar"}
                 record["avatar"] = p.get("avatar")
             else:
-                p = await self._group_info(event.bot, group_id, user_id, flag, comment)
+                p = await self._group_info(
+                    self._event_bot(event), group_id, user_id, flag, comment
+                )
                 record["group"] = {k: v for k, v in p.items() if k != "avatar"}
                 record["avatar"] = p.get("avatar")
             record.update(
@@ -996,6 +1030,7 @@ class SmartRequestReview(Star):
         record["status"] = "pending"
         targets = await self._notify_reviewers(event, record)
         if not targets:
+            self.seen_flags.pop(self._request_key(record), None)
             self._persist_history(
                 record, "notification_failed", error="审核消息未发送或未返回消息ID"
             )
@@ -1019,7 +1054,9 @@ class SmartRequestReview(Star):
                     "local_blacklist": True,
                 }
                 record["recommendation"] = {"action": "reject", "reason": blocked}
-            ok, error = await self._approve(event.bot, record, approve, reason)
+            ok, error = await self._approve(
+                self._event_bot(event), record, approve, reason
+            )
             if ok:
                 self._on_success(record, approve)
         if not ok:
@@ -1088,12 +1125,16 @@ class SmartRequestReview(Star):
             self._save_state()
         # Profile APIs may fail after the bot leaves; blacklist persistence has already succeeded.
         group = (
-            await self._data(event.bot, "get_group_info", group_id=int(group_id))
+            await self._data(
+                self._event_bot(event), "get_group_info", group_id=int(group_id)
+            )
             if group_id.isdigit()
             else None
         )
         person = (
-            await self._data(event.bot, "get_stranger_info", user_id=int(operator))
+            await self._data(
+                self._event_bot(event), "get_stranger_info", user_id=int(operator)
+            )
             if valid_operator
             else None
         )
@@ -1117,13 +1158,17 @@ class SmartRequestReview(Star):
         for target in self._review_targets():
             if target != f"group:{group_id}":
                 delivered = (
-                    bool(await self._send_segments(event.bot, target, text))
+                    bool(
+                        await self._send_segments(self._event_bot(event), target, text)
+                    )
                     or delivered
                 )
         if not delivered:
             for uid in sorted(self.admin_users() | self.astrbot_admins()):
                 if uid.isdigit():
-                    await self._send_segments(event.bot, f"private:{uid}", text)
+                    await self._send_segments(
+                        self._event_bot(event), f"private:{uid}", text
+                    )
 
     def _in_allowed_session(self, event):
         group_id = str(event.get_group_id() or "")
@@ -1145,7 +1190,7 @@ class SmartRequestReview(Star):
         if management or not event.get_group_id() or not sender.isdigit():
             return False
         member = await self._data(
-            event.bot,
+            self._event_bot(event),
             "get_group_member_info",
             group_id=int(event.get_group_id()),
             user_id=int(sender),
@@ -1214,7 +1259,9 @@ class SmartRequestReview(Star):
                         "申请对象已在黑名单中，不能同意；请引用消息拒绝。"
                     )
                     return
-                ok, error = await self._approve(event.bot, record, approve, reason)
+                ok, error = await self._approve(
+                    self._event_bot(event), record, approve, reason
+                )
                 if ok:
                     record["manual_reason"] = reason
                     self._on_success(record, approve, force_block=action == "拉黑")
@@ -1263,7 +1310,8 @@ class SmartRequestReview(Star):
             yield event.plain_result("你没有关系管理权限。")
             return
         ok, data, error = await self._call(
-            event.bot, "get_group_list" if kind == "group" else "get_friend_list"
+            self._event_bot(event),
+            "get_group_list" if kind == "group" else "get_friend_list",
         )
         if not ok or not isinstance(data, list):
             yield event.plain_result("列表获取失败：" + (error or "返回格式错误"))
@@ -1309,7 +1357,7 @@ class SmartRequestReview(Star):
                 )
             )
             mid = await self._send_segments(
-                event.bot,
+                self._event_bot(event),
                 event.unified_msg_origin,
                 text if image else full,
                 image,
@@ -1327,7 +1375,7 @@ class SmartRequestReview(Star):
                 return
             if image:
                 mid = await self._send_segments(
-                    event.bot, event.unified_msg_origin, full
+                    self._event_bot(event), event.unified_msg_origin, full
                 )
             if not mid:
                 yield event.plain_result(full)
@@ -1409,7 +1457,8 @@ class SmartRequestReview(Star):
             direct.update(str(snap[1][i - 1].get(id_key)) for i in indexes)
         # Recheck by IDs; never reinterpret snapshot indices against a new list.
         current = await self._data(
-            event.bot, "get_group_list" if kind == "group" else "get_friend_list"
+            self._event_bot(event),
+            "get_group_list" if kind == "group" else "get_friend_list",
         )
         if not isinstance(current, list):
             yield event.plain_result("无法确认当前关系，操作未执行。")
@@ -1421,7 +1470,9 @@ class SmartRequestReview(Star):
                 results.append(f"{ident} 已不在当前列表，跳过")
                 continue
             action = "set_group_leave" if kind == "group" else "delete_friend"
-            ok, _, error = await self._call(event.bot, action, **{id_key: int(ident)})
+            ok, _, error = await self._call(
+                self._event_bot(event), action, **{id_key: int(ident)}
+            )
             results.append(
                 f"{'已退群' if kind == 'group' else '已删好友'} {self._display_id(ident)}"
                 if ok

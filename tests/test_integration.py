@@ -376,7 +376,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def call(action, **params):
             actions.append((action, params))
             if action == "get_group_info":
-                self.assertEqual(params, {"group_id": 22222})
+                self.assertEqual(params, {"group_id": 22222, "self_id": 12345})
                 return {
                     "group_name": "标准接口群名",
                     "group_memo": "标准群简介",
@@ -385,7 +385,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "group_level": 3,
                 }
             if action == "get_stranger_info":
-                self.assertEqual(params, {"user_id": 55555})
+                self.assertEqual(params, {"user_id": 55555, "self_id": 12345})
             return await original(action, **params)
 
         self.bot.call_action = call
@@ -638,6 +638,96 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.approvals()), 1)
         self.assertEqual(self.approvals()[0][1]["sub_type"], "invite")
         self.assertTrue(any("已经处理" in x for x in a + b))
+
+    async def test_shared_onebot_accounts_concurrent_same_flag_and_message_id(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            self.assertIn(params.get("self_id"), (12345, 54321))
+            result = await original(action, **params)
+            if action.startswith("send_"):
+                return {"message_id": 101}  # IDs may collide between accounts.
+            return result
+
+        self.bot.call_action = call
+        raw = {
+            "request_type": "friend",
+            "user_id": "55555",
+            "flag": "same",
+            "comment": "希望一起交流",
+        }
+        a = Event(self.bot, bot_id="12345")
+        b = Event(self.bot, bot_id="54321")
+        await asyncio.gather(
+            self.p._process_request(a, raw), self.p._process_request(b, raw)
+        )
+        self.assertEqual(len(self.p.pending), 2)
+        self.assertEqual(
+            {r["bot_id"] for r in self.p.pending.values()}, {"12345", "54321"}
+        )
+        restored = plugin.SmartRequestReview(self.context, self.config)
+        a.components, b.components = [Reply("101")], [Reply("101")]
+        await asyncio.gather(
+            collect(restored._handle_command(a, "同意")),
+            collect(restored._handle_command(b, "拒绝")),
+        )
+        outcomes = {p["self_id"]: p["approve"] for _, p in self.approvals()}
+        self.assertEqual(outcomes, {12345: True, 54321: False})
+        self.assertTrue(
+            all(r["status"] == "processed" for r in restored.pending.values())
+        )
+
+    async def test_separate_adapters_same_bot_id_do_not_suppress_requests(self):
+        raw = {"request_type": "friend", "user_id": "55555", "flag": "same"}
+        other = FakeBot()
+        await asyncio.gather(
+            self.p._process_request(Event(self.bot, platform="onebot-a"), raw),
+            self.p._process_request(Event(other, platform="onebot-b"), raw),
+        )
+        self.assertEqual(len(self.p.pending), 2)
+        self.assertEqual(
+            {r["platform_id"] for r in self.p.pending.values()},
+            {"onebot-a", "onebot-b"},
+        )
+        self.assertTrue(any(a == "send_group_msg" for a, _ in other.calls))
+
+    async def test_bot_cannot_send_to_review_group_falls_back_private(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "send_group_msg":
+                self.bot.calls.append((action, params))
+                return {"status": "failed", "retcode": 100, "message": "not in group"}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        self.event = Event(self.bot, bot_id="54321")
+        await self.request()
+        record = self.pending()
+        self.assertEqual(record["review_session"], "private:99999")
+        event = Event(self.bot, bot_id="54321", group="", reply=record["message_id"])
+        await collect(self.p._handle_command(event, "同意"))
+        self.assertEqual(self.approvals()[0][1]["self_id"], 54321)
+        self.assertTrue(all(p.get("self_id") == 54321 for _, p in self.bot.calls))
+
+    async def test_failed_notification_does_not_suppress_redelivered_request(self):
+        self.bot.fail_send = True
+        await self.request()
+        self.assertFalse(self.p.pending)
+        self.bot.fail_send = False
+        await self.request()
+        self.assertEqual(len(self.p.pending), 1)
+
+    async def test_relationship_management_uses_receiving_bot(self):
+        event = Event(self.bot, bot_id="54321", text="退群 20001")
+        await collect(self.p._relationship_action(event, "group"))
+        actions = [
+            (a, p)
+            for a, p in self.bot.calls
+            if a in {"get_group_list", "set_group_leave"}
+        ]
+        self.assertTrue(any(a == "set_group_leave" for a, _ in actions))
+        self.assertTrue(all(p["self_id"] == 54321 for _, p in actions))
 
     async def test_isolated_group_session_can_quote_pending_card(self):
         await self.request()
