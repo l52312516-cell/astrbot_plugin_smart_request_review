@@ -89,6 +89,7 @@ class FakeBot:
         self.calls = []
         self.mid = 100
         self.fail_approval = False
+        self.already_agreed = False
         self.fail_image = False
         self.fail_send = False
         self.role = "member"
@@ -103,6 +104,17 @@ class FakeBot:
         self.calls.append((action, copy.deepcopy(params)))
         await asyncio.sleep(0)
         if action.startswith("set_") and action.endswith("_request"):
+            if (
+                self.already_agreed
+                and action == "set_group_add_request"
+                and params.get("approve")
+            ):
+                return {
+                    "status": "failed",
+                    "retcode": 1200,
+                    "data": None,
+                    "message": "already agree msg by self",
+                }
             if self.fail_approval:
                 return {"status": "ok", "retcode": 100, "data": None}
             return {"status": "ok", "retcode": 0, "data": {}}
@@ -849,6 +861,33 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("失败", result[0])
         self.assertEqual(self.pending()["status"], "pending")
         self.assertEqual(self.p.rejections, {})
+
+    async def test_group_already_agreed_is_idempotent_auto_success(self):
+        self.config["mode"] = "auto"
+        self.config["group_allowlist"] = ["22222"]
+        self.bot.already_agreed = True
+        await self.request("group", flag="already-agreed")
+        self.assertEqual(len(self.approvals()), 1)
+        self.assertTrue(self.approvals()[0][1]["approve"])
+        self.assertEqual(self.p.history[-1]["outcome"], "已同意（接口提示此前已同意）")
+        self.assertEqual(self.p.rejections, {})
+        self.assertTrue(
+            all("审批接口失败" not in str(x) for x in self.p.history[-1].values())
+        )
+
+    async def test_group_already_agreed_is_idempotent_manual_success(self):
+        self.bot.already_agreed = True
+        await self.request("group", flag="already-agreed-manual")
+        record = self.pending()
+        result = await collect(
+            self.p._handle_command(
+                Event(self.bot, reply=record["message_id"], text="同意"), "同意"
+            )
+        )
+        self.assertIn("已同意", result[-1])
+        self.assertEqual(record["status"], "processed")
+        self.assertEqual(self.p.history[-1]["outcome"], "已同意（接口提示此前已同意）")
+        self.assertIn("approval_note", self.p.history[-1])
 
     async def test_rejection_limit_and_success_reset(self):
         for i in range(3):

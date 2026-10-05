@@ -341,7 +341,25 @@ class SmartRequestReview(Star):
                 approve=approve,
                 reason=reason if not approve else "",
             )
+        if not ok and self._already_processed_error(error, record, approve):
+            # OneBot/NapCat may report a duplicate invite approval as an error
+            # even though the requested state is already in effect. Treat this
+            # as an idempotent success so it is not retried or shown as failure.
+            record["approval_note"] = error
+            return True, ""
         return ok, error
+
+    @staticmethod
+    def _already_processed_error(error, record, approve):
+        if not approve or record.get("kind") != "group":
+            return False
+        text = str(error or "").casefold()
+        return (
+            "already agree msg by self" in text
+            or "already agreed" in text
+            or "retcode=1200" in text
+            or "retcode:1200" in text
+        )
 
     async def _send_segments(
         self, bot, target, text, image=None, fallback_text=None, retry_text=True
@@ -829,6 +847,8 @@ class SmartRequestReview(Star):
                 f"申请人：{name('nickname')}（QQ号 {self._display_id(p.get('user_id') or record.get('subject_id'))}）"
             )
         lines.append(f"{suggestion}：{conclusion['reason']}")
+        if record.get("approval_note"):
+            lines.append("接口提示：此前已同意，本次按已同意处理")
         if record.get("manual_reason"):
             lines.append("人工理由：" + record["manual_reason"][:100])
         if full:
@@ -1068,6 +1088,8 @@ class SmartRequestReview(Star):
             if approve
             else ("已拒绝并加入本地黑名单" if record["blacklisted"] else "已拒绝")
         )
+        if record.get("approval_note") and approve:
+            outcome = "已同意（接口提示此前已同意）"
         record.update(status="processed", result=outcome, final_reason=reason)
         self._persist_history(record, outcome)
         await self._notify_reviewers(event, record, outcome)
@@ -1274,6 +1296,8 @@ class SmartRequestReview(Star):
                             else "已拒绝"
                         )
                     )
+                    if record.get("approval_note") and approve:
+                        outcome = "已同意（接口提示此前已同意）"
                     for other in self.pending.values():
                         if self._request_key(other) == self._request_key(record):
                             other.update(
