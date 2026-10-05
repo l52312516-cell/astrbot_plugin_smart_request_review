@@ -32,6 +32,7 @@ from .core.logic import (
     unwrap_data,
 )
 from .core.providers import ProviderSelector
+from .core.profiles import meaningful, merge_group
 
 try:
     from .core.renderer import ReviewCardRenderer
@@ -364,12 +365,17 @@ class SmartRequestReview(Star):
 
     async def _friend_profile(self, bot, user_id, comment):
         ok, raw, error = await self._call(
-            bot, "get_stranger_info", user_id=int(user_id), no_cache=True
+            bot, "get_stranger_info", user_id=int(user_id)
         )
-        if not ok:
+        if not ok or not isinstance(raw, dict) or not meaningful(raw.get("nickname")):
+            original = raw if ok and isinstance(raw, dict) else {}
             ok, raw, error = await self._call(
-                bot, "get_stranger_info", user_id=int(user_id)
+                bot, "get_stranger_info", user_id=int(user_id), no_cache=True
             )
+            raw = {
+                **(raw if ok and isinstance(raw, dict) else {}),
+                **{k: v for k, v in original.items() if meaningful(v)},
+            }
         raw = raw if isinstance(raw, dict) else {}
         profile = {
             "user_id": user_id,
@@ -403,9 +409,16 @@ class SmartRequestReview(Star):
         return profile
 
     async def _group_info(self, bot, group_id, inviter_id, flag, comment):
+        """Collect the same request context as astrbot_plugin_relationship.
+
+        The request itself only has inviter/group IDs.  The reliable sources are
+        the standard stranger and group APIs; inbox/system-message APIs are not
+        used because they may contain stale or unrelated requests.
+        """
         info = {
             "group_id": group_id,
             "inviter_id": inviter_id,
+            "inviter_nickname": None,
             "comment": comment,
             "errors": [],
             "notices": [],
@@ -417,104 +430,41 @@ class SmartRequestReview(Star):
         info["avatar"] = await self._download_image(
             f"https://p.qlogo.cn/gh/{group_id}/{group_id}/640/"
         )
-        aliases = {
-            "name": ("group_name", "name"),
-            "remark": ("group_remark", "remark"),
-            "memo": ("group_description", "group_memo", "memo"),
-            "member_count": ("member_count",),
-            "max_member_count": ("max_member_count",),
-            "level": ("group_level", "level"),
-        }
-        for action in ("get_group_info", "get_group_info_ex"):
-            ok, data, error = await self._call(
-                bot, action, group_id=int(group_id), no_cache=True
+
+        # Keep the call shape used by relationship's GroupRequest._from_raw:
+        # get_stranger_info(user_id=...) and get_group_info(group_id=...).
+        ok, inviter, error = await self._call(
+            bot, "get_stranger_info", user_id=int(inviter_id)
+        )
+        if ok and isinstance(inviter, dict):
+            info["raw"]["get_stranger_info"] = inviter
+            info["inviter_nickname"] = first_value(
+                inviter, "nickname", "nick", "name", default=None
             )
-            if not ok:
-                ok, data, error = await self._call(bot, action, group_id=int(group_id))
-            if isinstance(data, dict):
-                info["raw"][action] = data
-                for key, keys in aliases.items():
-                    value = first_value(data, *keys, default=None)
-                    if value is not None and value != "":
-                        info[key] = value
-            if not ok:
-                info["errors"].append(f"{action}：{error}")
-        for action in ("get_group_system_msg", "get_group_ignored_notifies"):
-            if info.get("name") and info.get("inviter_nickname"):
-                break
-            ok, data, error = await self._call(bot, action)
-            if isinstance(data, dict):
-                data = [x for v in data.values() if isinstance(v, list) for x in v]
-            if isinstance(data, list):
-                for entry in data:
-                    if (
-                        not isinstance(entry, dict)
-                        or str(entry.get("group_id") or "") != group_id
-                    ):
-                        continue
-                    entry_flag = str(entry.get("flag") or entry.get("request_id") or "")
-                    if entry_flag and entry_flag != flag:
-                        continue
-                    info["name"] = info.get("name") or entry.get("group_name")
-                    info["inviter_nickname"] = first_value(
-                        entry,
-                        "invitor_nick",
-                        "inviter_nick",
-                        "requester_nick",
-                        default=None,
-                    )
-            if not ok:
-                info["errors"].append(f"{action}：{error}")
-        if not info.get("inviter_nickname"):
-            inviter = await self._data(
-                bot, "get_stranger_info", user_id=int(inviter_id)
+        if not meaningful(info.get("inviter_nickname")):
+            info["inviter_nickname"] = None
+            info["errors"].append("邀请人昵称未提供" + (f"：{error}" if error else ""))
+
+        ok, data, error = await self._call(
+            bot, "get_group_info", group_id=int(group_id)
+        )
+        if ok and isinstance(data, dict):
+            info["raw"]["get_group_info"] = data
+            merge_group(info, data)
+        else:
+            info["errors"].append(
+                "get_group_info：" + (error or "返回资料为空或格式不正确")
             )
-            if isinstance(inviter, dict):
-                info["inviter_nickname"] = first_value(
-                    inviter, "nickname", "nick", default=None
-                )
-        for action in ("_get_group_notice", "get_group_notice"):
-            ok, data, error = await self._call(bot, action, group_id=int(group_id))
-            if isinstance(data, dict):
-                data = data.get("notices") or data.get("items")
-            if isinstance(data, list):
-                info["notices"] = data
-                break
-            if not ok:
-                info["errors"].append(f"{action}：{error}")
-        ok, data, error = await self._call(
-            bot, "get_essence_msg_list", group_id=int(group_id)
-        )
-        if isinstance(data, list):
-            info["essence"] = data
-        elif not ok:
-            info["errors"].append(f"get_essence_msg_list：{error}")
-        ok, data, error = await self._call(
-            bot, "get_group_honor_info", group_id=int(group_id), type="all"
-        )
-        if isinstance(data, (dict, list)):
-            info["honor"] = data
-        elif not ok:
-            info["errors"].append(f"get_group_honor_info：{error}")
-        ok, data, error = await self._call(
-            bot, "get_group_member_list", group_id=int(group_id)
-        )
-        if isinstance(data, list):
-            info["members"] = data
-            info["admins"] = [
-                x
-                for x in data
-                if isinstance(x, dict) and x.get("role") in {"owner", "admin"}
-            ]
-        elif not ok:
-            info["errors"].append(f"get_group_member_list：{error}")
+
         for key, label in (
             ("name", "群名"),
             ("member_count", "群人数"),
+            ("max_member_count", "群人数上限"),
             ("level", "群等级"),
         ):
-            if info.get(key) is None or info.get(key) == "":
-                info["errors"].append(f"{label}未知：协议端可能未提供未加入群的资料")
+            if not meaningful(info.get(key)):
+                info[key] = None
+                info["errors"].append(f"{label}未知：标准群资料未提供")
         if not info["avatar"]:
             info["errors"].append("群头像下载失败")
         return info
@@ -665,9 +615,7 @@ class SmartRequestReview(Star):
                         k: p.get(k) for k in ("name", "remark", "memo")
                     }, None
                 elif key == "group_text":
-                    data, image = {
-                        k: p.get(k) for k in ("memo", "notices", "essence", "honor")
-                    }, None
+                    data, image = {"memo": p.get("memo")}, None
                 else:
                     data, image = (
                         p.get(
@@ -684,10 +632,7 @@ class SmartRequestReview(Star):
                     bool(image)
                     if key == "friend_avatar"
                     else (
-                        any(
-                            v is not None and v != "" and v != [] and v != {}
-                            for v in data.values()
-                        )
+                        any(meaningful(v) for v in data.values())
                         if isinstance(data, dict)
                         else bool(as_text(data))
                     )
@@ -777,10 +722,25 @@ class SmartRequestReview(Star):
         suggestion = {"approve": "建议同意", "reject": "建议拒绝", "block": "建议拉黑"}[
             conclusion["action"]
         ]
+        p = record.get("profile") or record.get("group") or {}
+
+        def name(key):
+            return as_text(p.get(key)).strip().replace("\n", " ")[:80]
+
         lines = [
-            f"【{'好友申请' if record['kind'] == 'friend' else '群聊邀请'}】{outcome}",
-            f"{suggestion}：{conclusion['reason']}",
+            f"【{'好友申请' if record['kind'] == 'friend' else '群聊邀请'}】{outcome}"
         ]
+        if record["kind"] == "group":
+            if name("name"):
+                lines.append(f"群名称：{name('name')}")
+            lines.append(
+                f"邀请人：{name('inviter_nickname')}（QQ号 {self._display_id(p.get('inviter_id') or record.get('subject_id'))}）  群号：{self._display_id(p.get('group_id'))}"
+            )
+        else:
+            lines.append(
+                f"申请人：{name('nickname')}（QQ号 {self._display_id(p.get('user_id') or record.get('subject_id'))}）"
+            )
+        lines.append(f"{suggestion}：{conclusion['reason']}")
         if record.get("manual_reason"):
             lines.append("人工理由：" + record["manual_reason"][:100])
         if full:
@@ -808,6 +768,8 @@ class SmartRequestReview(Star):
                 )
             )
             for key, label in fields:
+                if not meaningful(p.get(key)):
+                    continue
                 text = (
                     self._display_id(p.get(key))
                     if key in {"user_id", "group_id", "inviter_id"}
@@ -822,8 +784,6 @@ class SmartRequestReview(Star):
                 f"{x['name']} {x['score']}/{x['max']} ({x['state']})：{x['reason'][:100]}"
                 for x in record.get("items", [])
             ]
-            if record.get("missing"):
-                lines.append("缺失/接口失败：" + "；".join(record["missing"])[:500])
             lines.append(f"累计拒绝：{record.get('rejection_count', 0)}")
         if outcome == "待审批":
             lines.append("请引用本消息：同意 / 拒绝 [理由] / 拉黑 [理由]")

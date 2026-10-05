@@ -275,6 +275,174 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             if a in {"set_friend_add_request", "set_group_add_request"}
         ]
 
+    async def test_group_standard_query_preserves_good_fields_against_extension_shell(
+        self,
+    ):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_info_ex":
+                return {
+                    "group_name": " ",
+                    "member_count": 0,
+                    "max_member_count": 0,
+                    "group_level": 0,
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        info = await self.p._group_info(self.bot, "22222", "55555", "opaque", "")
+        first = next(p for a, p in self.bot.calls if a == "get_group_info")
+        self.assertNotIn("no_cache", first)
+        self.assertEqual(info["name"], "动漫交流群")
+        self.assertEqual(info["member_count"], 88)
+        self.assertEqual(info["level"], 3)
+
+    async def test_standard_shell_does_not_use_unrelated_receipts(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"get_group_info", "get_group_info_ex"}:
+                return {
+                    "group_name": " ",
+                    "member_count": 0,
+                    "max_member_count": 0,
+                    "group_level": 0,
+                }
+            if action == "get_stranger_info":
+                return {"nickname": "  "}
+            if action == "get_group_system_msg":
+                return {
+                    "invited_requests": [
+                        {
+                            "group_id": 22222,
+                            "request_id": 123,
+                            "invitor_uin": 55555,
+                            "invitor_nick": "邀请者",
+                            "group_name": "收件箱群名",
+                            "message": "旧验证内容",
+                        }
+                    ]
+                }
+            if action == "get_group_honor_info":
+                return {
+                    "group_id": 22222,
+                    "current_talkative": None,
+                    "talkative_list": [],
+                }
+            if action in {
+                "_get_group_notice",
+                "get_group_notice",
+                "get_essence_msg_list",
+            }:
+                return []
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="opaque", comment="")
+        record = self.pending()
+        info = record["group"]
+        self.assertIsNone(info["name"])
+        self.assertIsNone(info["inviter_nickname"])
+        self.assertEqual(info["comment"], "")
+        self.assertIsNone(info["level"])
+        self.assertIsNone(info["member_count"])
+        self.assertIsNone(info["honor"])
+        scores = {v["key"]: v for v in record["items"]}
+        for key in ("group_level", "group_member", "group_text"):
+            self.assertEqual(scores[key]["state"], "unknown")
+        text = self.p._report(record)
+        self.assertNotIn("群名称：", text)
+        self.assertIn("QQ号 55555", text)
+        self.assertIn("群号：22222", text)
+        self.assertTrue(info["raw"])
+
+    async def test_empty_standard_query_stays_unknown(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_info" and not params.get("no_cache"):
+                return {"group_name": "", "member_count": 0}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        info = await self.p._group_info(self.bot, "22222", "55555", "F1", "")
+        self.assertIsNone(info["name"])
+
+    async def test_relationship_api_parameters_and_score_sources(self):
+        original = self.bot.call_action
+        actions = []
+
+        async def call(action, **params):
+            actions.append((action, params))
+            if action == "get_group_info":
+                self.assertEqual(params, {"group_id": 22222})
+                return {
+                    "group_name": "标准接口群名",
+                    "group_memo": "标准群简介",
+                    "member_count": 80,
+                    "max_member_count": 200,
+                    "group_level": 3,
+                }
+            if action == "get_stranger_info":
+                self.assertEqual(params, {"user_id": 55555})
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group")
+        self.assertEqual(
+            [a for a, _ in actions if not a.startswith("send_")],
+            ["get_stranger_info", "get_group_info"],
+        )
+        record = self.pending()
+        scores = {v["key"]: v for v in record["items"]}
+        self.assertEqual(scores["group_member"]["score"], 2)
+        self.assertEqual(scores["group_level"]["score"], 1)
+        prompts = "\n".join(
+            c.kwargs["prompt"] for c in self.context.llm_generate.call_args_list
+        )
+        self.assertIn("标准接口群名", prompts)
+        self.assertIn("标准群简介", prompts)
+        self.assertIn("希望一起交流", prompts)
+        self.assertIn("群名称：标准接口群名", self.p._report(record))
+
+    async def test_brief_identity_and_hide_unavailable_fields(self):
+        await self.request()
+        text = self.p._report(self.pending())
+        self.assertIn("QQ号 55555", text)
+        record = {
+            "kind": "group",
+            "subject_id": "55555",
+            "group": {"group_id": "22222"},
+            "score": 0,
+            "threshold": 6,
+            "items": [],
+            "missing": ["private diagnostic"],
+            "hard_rule": {"reason": "未命中硬规则"},
+        }
+        text = self.p._report(record, full=True)
+        self.assertNotIn("群名称：", text)
+        self.assertNotIn("人数：", text)
+        self.assertNotIn("未知", text)
+        self.assertNotIn("private diagnostic", text)
+        from review_under_test.core import renderer
+
+        recorded = []
+        original = renderer.lines_for
+
+        def observe(value, *args, **kwargs):
+            recorded.append(str(value))
+            return original(value, *args, **kwargs)
+
+        with patch.object(renderer, "lines_for", side_effect=observe):
+            renderer.ReviewCardRenderer().render(record)
+        self.assertFalse(
+            any(
+                "群名称：" in v or "人数 / 上限：" in v or "private diagnostic" in v
+                for v in recorded
+            )
+        )
+
     def pending(self):
         return next(iter(self.p.pending.values()))
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from .profiles import meaningful
 
 RESOURCE_DIR = Path(__file__).resolve().parent / "resource"
 STATE_NAMES = {
@@ -77,7 +78,11 @@ class ReviewCardRenderer:
                 ("QQ等级", p.get("level")),
                 (
                     "性别 / 地区",
-                    " / ".join(text_value(p.get(k)) for k in ("sex", "area")),
+                    " / ".join(
+                        str(p[k])
+                        for k in ("sex", "area")
+                        if meaningful(p.get(k)) and p[k] != "unknown"
+                    ),
                 ),
                 ("签名", p.get("signature")),
                 ("验证信息", p.get("comment")),
@@ -89,12 +94,22 @@ class ReviewCardRenderer:
                 ("群备注", p.get("remark")),
                 (
                     "人数 / 上限",
-                    f"{text_value(p.get('member_count'))} / {text_value(p.get('max_member_count'))}",
+                    (
+                        str(p["member_count"])
+                        if meaningful(p.get("member_count"))
+                        else ""
+                    )
+                    + (
+                        f" / {p['max_member_count']}"
+                        if meaningful(p.get("member_count"))
+                        and meaningful(p.get("max_member_count"))
+                        else ""
+                    ),
                 ),
                 ("群等级", p.get("level")),
                 (
                     "邀请人",
-                    f"{text_value(p.get('inviter_nickname'))} ({text_value(p.get('inviter_id'))})",
+                    f"{p.get('inviter_nickname') or ''} ({p.get('inviter_id') or record.get('subject_id') or ''})".strip(),
                 ),
                 ("验证信息", p.get("comment")),
                 ("群简介", p.get("memo")),
@@ -114,7 +129,8 @@ class ReviewCardRenderer:
         )
         section("申请资料")
         for label, value in fields:
-            add(f"{label}：{text_value(value)}", max_lines=2)
+            if meaningful(value):
+                add(f"{label}：{text_value(value)}", max_lines=2)
         section("审核依据")
         add(
             "硬规则：" + str(record.get("hard_rule", {}).get("reason", "未知")),
@@ -169,10 +185,6 @@ class ReviewCardRenderer:
                 12,
             )
         add(f"累计拒绝：{record.get('rejection_count', 0)} 次", 25, "#44576a", 1)
-        if record.get("missing"):
-            add(
-                "资料缺失 / 接口失败：" + "；".join(record["missing"]), 22, "#8a6335", 3
-            )
         if error:
             add("执行失败：" + error, 25, "#c23b40", 3)
         if record.get("manual_reason"):
@@ -209,18 +221,19 @@ class ReviewCardRenderer:
         draw.rounded_rectangle((30, 30, width - 30, 205), 18, fill="#e9f2fa")
         avatar_box = (48, 48, 192, 192)
         avatar = record.get("avatar") or p.get("avatar")
+        title_x = 48
         try:
             with Image.open(io.BytesIO(avatar or b"")) as source:
                 av = ImageOps.fit(source.convert("RGB"), (144, 144))
             canvas.paste(av, avatar_box[:2])
+            title_x = 218
         except Exception:
-            draw.rounded_rectangle(avatar_box, 18, fill="#c8dcec")
-            draw.text((77, 98), "暂无头像", font=font(22), fill="#486b88")
+            pass
         title = "好友申请" if kind == "friend" else "群聊邀请"
-        draw.text((218, 50), title + " · 智能审核", font=font(39), fill="#193d61")
+        draw.text((title_x, 50), title + " · 智能审核", font=font(39), fill="#193d61")
         status = lines_for(outcome, 810, 26, 2)
         for i, line in enumerate(status):
-            draw.text((218, 112 + i * 36), line, font=font(26), fill="#3d5f7d")
+            draw.text((title_x, 112 + i * 36), line, font=font(26), fill="#3d5f7d")
         y = header_height
         for block in blocks:
             if block[0] == "bar":

@@ -239,9 +239,9 @@
     "default": "请判断群邀请验证信息是否具体、真实、合理。"
   },
   "group_text_prompt": {
-    "description": "群公告精华提示词",
+    "description": "群简介评分提示词",
     "type": "string",
-    "default": "请根据群简介、公告、精华或荣誉信息判断群是否符合审核目标。"
+    "default": "根据标准群资料中的群简介判断是否适合动漫、二次元兴趣交流。没有实质内容不得加分。"
   },
   "friend_score_threshold": {
     "description": "好友申请通过阈值",
@@ -428,12 +428,12 @@
     }
   },
   "group_text_enabled": {
-    "description": "启用群简介/公告/精华评分",
+    "description": "启用群简介评分",
     "type": "bool",
     "default": true
   },
   "group_text_max_score": {
-    "description": "群简介/公告/精华最高分",
+    "description": "群简介最高分",
     "type": "int",
     "default": 2,
     "slider": {

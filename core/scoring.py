@@ -21,7 +21,7 @@ SCORE_SPECS = {
         ("group_comment", "邀请验证信息", 2),
         ("group_member", "群人数", 2),
         ("group_level", "群等级", 1),
-        ("group_text", "群简介/公告/精华", 2),
+        ("group_text", "群简介", 2),
     ],
 }
 
