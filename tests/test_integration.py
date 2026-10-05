@@ -639,6 +639,119 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.approvals()[0][1]["sub_type"], "invite")
         self.assertTrue(any("已经处理" in x for x in a + b))
 
+    async def test_isolated_group_session_can_quote_pending_card(self):
+        await self.request()
+        event = self.reply_event()
+        event.unified_msg_origin = "aiocqhttp:GroupMessage:99999_88888"
+        result = await collect(self.p._handle_command(event, "同意"))
+        self.assertIn("已同意", result[-1])
+        self.assertEqual(len(self.approvals()), 1)
+
+    async def test_raw_reply_id_survives_adapter_get_msg_id_conversion(self):
+        await self.request("group")
+        event = self.reply_event()
+        event.components[0].id = "converted-message-id"
+        event.message_obj = types.SimpleNamespace(
+            raw_message={
+                "message": [
+                    {"type": "reply", "data": {"id": self.pending()["message_id"]}},
+                    {"type": "text", "data": {"text": "同意"}},
+                ]
+            }
+        )
+        result = await collect(self.p._handle_command(event, "同意"))
+        self.assertIn("已同意", result[-1])
+        self.assertEqual(self.approvals()[0][1]["sub_type"], "invite")
+
+    async def test_unmatched_raw_reply_cannot_use_converted_or_forged_text(self):
+        await self.request()
+        event = self.reply_event()
+        event.message_obj = types.SimpleNamespace(
+            raw_message={
+                "message": [
+                    {"type": "reply", "data": {"id": "ordinary-message"}},
+                    {"type": "text", "data": {"text": self.p._report(self.pending())}},
+                ]
+            }
+        )
+        await collect(self.p._handle_command(event, "同意"))
+        self.assertFalse(self.approvals())
+
+    async def test_avatar_download_reads_all_chunks_before_decoding(self):
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (32, 32), "#ed5736").save(buffer, "PNG")
+        payload = buffer.getvalue()
+
+        class Stream:
+            async def iter_chunked(self, size):
+                for offset in range(0, len(payload), 7):
+                    yield payload[offset : offset + 7]
+
+        class Response:
+            content = Stream()
+
+            def raise_for_status(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class Session:
+            def __init__(self, **kw):
+                pass
+
+            def get(self, url):
+                return Response()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with patch.object(plugin.aiohttp, "ClientSession", Session):
+            data = await plugin.SmartRequestReview._download_image(
+                self.p, "https://example.invalid/avatar"
+            )
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            self.assertEqual(image.getpixel((10, 10)), (237, 87, 54))
+
+    async def test_friend_and_group_avatar_render_after_restart(self):
+        from PIL import Image
+        import base64
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (60, 60), "#ed5736").save(buffer, "PNG")
+        self.p._download_image = AsyncMock(return_value=buffer.getvalue())
+        self.p.renderer = ReviewCardRenderer()
+        for kind in ("friend", "group"):
+            await self.request(kind, flag=kind)
+        restored = plugin.SmartRequestReview(self.context, self.config)
+        records = list(restored.pending.values())
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all("avatar_ref" in r and "avatar" not in r for r in records))
+        for record in records:
+            await restored._notify_reviewers(self.event, record, "已同意")
+        sends = [p["message"] for a, p in self.bot.calls if a == "send_group_msg"]
+        self.assertEqual(len(sends), 4)
+        for message in sends:
+            encoded = next(v["data"]["file"] for v in message if v["type"] == "image")
+            with Image.open(
+                io.BytesIO(base64.b64decode(encoded.removeprefix("base64://")))
+            ) as image:
+                self.assertEqual(image.getpixel((100, 100)), (237, 87, 54))
+
+    async def test_avatar_cdn_fallback(self):
+        self.p._download_image = AsyncMock(side_effect=[None, b"fallback"])
+        self.assertEqual(await self.p._load_avatar("friend", "55555"), b"fallback")
+        self.assertEqual(self.p._download_image.await_count, 2)
+
     async def test_approval_failure_no_success_no_rejection_count(self):
         await self.request()
         self.bot.fail_approval = True

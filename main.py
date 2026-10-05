@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import inspect
+import hashlib
 import json
 import re
 import time
@@ -68,6 +69,11 @@ def target_session(target):
             return f"{'private' if prefix == 'friend' else prefix}:{ident}"
         return ""
     parts = target.rsplit(":", 2)
+    if len(parts) == 3 and "group" in parts[-2].lower():
+        # AstrBot isolated group sessions may use sender_group as the session ID.
+        ident = parts[-1].split("_")[-1]
+        if ident.isdigit() and int(ident) > 0:
+            return f"group:{ident}"
     if len(parts) == 3 and parts[-1].isdigit() and int(parts[-1]) > 0:
         return f"{'group' if 'group' in parts[-2].lower() else 'private'}:{parts[-1]}"
     return ""
@@ -91,6 +97,7 @@ class SmartRequestReview(Star):
         super().__init__(context)
         self.context, self.config = context, config
         folder = Path(StarTools.get_data_dir(PLUGIN_NAME))
+        self.avatar_dir = folder / "avatars"
         self.pending_store = JsonStore(folder / "pending.json", {})
         self.history_store = JsonStore(folder / "history.json", [])
         self.blacklist_store = JsonStore(
@@ -183,9 +190,38 @@ class SmartRequestReview(Star):
             bot_id = str(event.get_self_id())
         except Exception:
             bot_id = str(raw_event(event).get("self_id") or "")
-        umo = str(getattr(event, "unified_msg_origin", "") or "")
-        platform_id = umo.rsplit(":", 2)[0] if ":" in umo else "aiocqhttp"
+        try:
+            platform_id = str(event.get_platform_id())
+        except (AttributeError, TypeError):
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            platform_id = umo.rsplit(":", 2)[0] if ":" in umo else "aiocqhttp"
         return bot_id, platform_id
+
+    def _event_target(self, event):
+        group_id = str(event.get_group_id() or "")
+        if group_id.isdigit() and int(group_id) > 0:
+            return f"group:{group_id}"
+        sender_id = str(event.get_sender_id() or "")
+        return f"private:{sender_id}" if sender_id.isdigit() else ""
+
+    def _reply_id(self, event):
+        # The adapter's get_msg expansion can replace Reply.id with another ID.
+        # The inbound OneBot reply segment is the original ID from this reply.
+        message = raw_event(event).get("message")
+        if isinstance(message, list):
+            for segment in message:
+                if isinstance(segment, dict) and segment.get("type") == "reply":
+                    mid = (segment.get("data") or {}).get("id")
+                    if mid is not None and str(mid).strip():
+                        return str(mid).strip()
+        elif isinstance(message, str):
+            match = re.search(r"\[CQ:reply,id=(-?\d+)(?:,[^\]]*)?\]", message)
+            if match:
+                return match.group(1)
+        return next(
+            (str(c.id).strip() for c in event.get_messages() if isinstance(c, Reply)),
+            "",
+        )
 
     def _request_key(self, record):
         return ":".join(
@@ -357,11 +393,59 @@ class SmartRequestReview(Star):
             ) as session:
                 async with session.get(url) as response:
                     response.raise_for_status()
-                    data = await response.content.read(5 * 1024 * 1024 + 1)
-                    return data if len(data) <= 5 * 1024 * 1024 else None
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        data.extend(chunk)
+                        if len(data) > 5 * 1024 * 1024:
+                            return None
+                    from .core.avatars import normalize_avatar
+
+                    return await asyncio.to_thread(normalize_avatar, bytes(data))
         except Exception as exc:
             logger.debug(f"[{PLUGIN_NAME}] 下载头像失败：{type(exc).__name__}")
             return None
+
+    async def _load_avatar(self, kind, ident):
+        urls = (
+            [
+                f"https://q4.qlogo.cn/headimg_dl?dst_uin={ident}&spec=640",
+                f"https://q1.qlogo.cn/g?b=qq&nk={ident}&s=100",
+            ]
+            if kind == "friend"
+            else [
+                f"https://p.qlogo.cn/gh/{ident}/{ident}/640/",
+                f"https://p.qlogo.cn/gh/{ident}/{ident}/100/",
+            ]
+        )
+        for url in urls:
+            data = await self._download_image(url)
+            if data:
+                return data
+        return None
+
+    def _cache_avatar(self, record):
+        data = record.get("avatar")
+        if not data:
+            return
+        ref = hashlib.sha256(data).hexdigest()
+        try:
+            self.avatar_dir.mkdir(parents=True, exist_ok=True)
+            path = self.avatar_dir / (ref + ".png")
+            if not path.exists():
+                temporary = path.with_suffix(".tmp")
+                temporary.write_bytes(data)
+                temporary.replace(path)
+            record["avatar_ref"] = ref
+        except OSError as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 头像缓存写入失败：{type(exc).__name__}")
+
+    def _restore_avatar(self, record):
+        ref = record.get("avatar_ref", "")
+        if not record.get("avatar") and re.fullmatch(r"[0-9a-f]{64}", ref):
+            try:
+                record["avatar"] = (self.avatar_dir / (ref + ".png")).read_bytes()
+            except OSError:
+                pass
 
     async def _friend_profile(self, bot, user_id, comment):
         ok, raw, error = await self._call(
@@ -401,9 +485,7 @@ class SmartRequestReview(Star):
         ):
             if profile[key] is None or profile[key] == "":
                 profile["errors"].append(f"{label}未提供")
-        profile["avatar"] = await self._download_image(
-            f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
-        )
+        profile["avatar"] = await self._load_avatar("friend", user_id)
         if not profile["avatar"]:
             profile["errors"].append("头像下载失败")
         return profile
@@ -427,9 +509,7 @@ class SmartRequestReview(Star):
             "honor": None,
             "raw": {},
         }
-        info["avatar"] = await self._download_image(
-            f"https://p.qlogo.cn/gh/{group_id}/{group_id}/640/"
-        )
+        info["avatar"] = await self._load_avatar("group", group_id)
 
         # Keep the call shape used by relationship's GroupRequest._from_raw:
         # get_stranger_info(user_id=...) and get_group_info(group_id=...).
@@ -792,9 +872,11 @@ class SmartRequestReview(Star):
         return "\n".join(lines)
 
     async def _notify_reviewers(self, event, record, outcome="待审批", error=""):
+        display = self._display_record(record)
+        self._restore_avatar(display)
         try:
             image = await asyncio.to_thread(
-                self.renderer.render, self._display_record(record), outcome, error
+                self.renderer.render, display, outcome, error
             )
         except Exception as exc:
             logger.warning(f"[{PLUGIN_NAME}] 卡片渲染失败：{type(exc).__name__}")
@@ -885,6 +967,7 @@ class SmartRequestReview(Star):
                 rejection_count=self._rejection_count(record),
                 mode=self.mode(),
             )
+            self._cache_avatar(record)
             record["hard_rule"] = self._hard_rule(record)
             action = record["hard_rule"]["action"]
             # Semi mode evaluates whitelist/keyword suggestions fully; local blacklist still rejects immediately.
@@ -1071,7 +1154,7 @@ class SmartRequestReview(Star):
 
     def _find_pending(self, event, mid):
         bot_id, platform_id = self._identity(event)
-        target = target_session(event.unified_msg_origin)
+        target = self._event_target(event)
         key = self._pending_key(bot_id, platform_id, target, mid)
         if key in self.pending:
             return key, self.pending[key]
@@ -1093,9 +1176,7 @@ class SmartRequestReview(Star):
         if not await self._is_reviewer(event):
             yield event.plain_result("你没有审批权限。")
             return
-        mid = next(
-            (str(c.id) for c in event.get_messages() if isinstance(c, Reply)), ""
-        )
+        mid = self._reply_id(event)
         if not mid:
             yield event.plain_result(
                 "请引用机器人发出的审核消息，再使用同意、拒绝或拉黑。"
@@ -1103,6 +1184,10 @@ class SmartRequestReview(Star):
             return
         _, candidate = self._find_pending(event, mid)
         if candidate is None:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 引用记录未匹配：bot/platform={self._identity(event)}, "
+                f"target={self._event_target(event)}, message_id={mid}"
+            )
             yield event.plain_result("引用的消息不是本会话中的有效审核消息。")
             return
         async with self._request_locks.setdefault(
