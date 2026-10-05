@@ -905,6 +905,69 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p.rejections, {})
         self.assertNotIn("审批接口失败", str(self.p.history[-1]))
 
+    async def test_auto_reject_leaves_group_when_already_joined(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_list":
+                return {"status": "ok", "retcode": 0, "data": [{"group_id": 22222}]}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="already-joined-reject")
+        self.assertFalse(any(a == "set_group_add_request" for a, _ in self.bot.calls))
+        leaves = [p for a, p in self.bot.calls if a == "set_group_leave"]
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(self.p.history[-1]["outcome"], "已拒绝（已入群，已退出群聊）")
+
+    async def test_auto_reject_reconciles_matching_request_not_found_after_join(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+        group_list_calls = 0
+
+        async def call(action, **params):
+            nonlocal group_list_calls
+            if action == "get_group_list":
+                group_list_calls += 1
+                groups = [{"group_id": 22222}] if group_list_calls >= 2 else []
+                return {"status": "ok", "retcode": 0, "data": groups}
+            if action == "set_group_add_request" and not params.get("approve"):
+                return {
+                    "status": "failed",
+                    "retcode": 100,
+                    "wording": "matching group request not found",
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="request-consumed-by-qq")
+        leaves = [p for a, p in self.bot.calls if a == "set_group_leave"]
+        self.assertEqual(len(leaves), 1)
+        self.assertEqual(self.p.history[-1]["outcome"], "已拒绝（已入群，已退出群聊）")
+        self.assertGreaterEqual(group_list_calls, 2)
+
+    async def test_auto_reject_keeps_real_failure_when_membership_unknown(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "set_group_add_request" and not params.get("approve"):
+                return {
+                    "status": "failed",
+                    "retcode": 100,
+                    "wording": "matching group request not found",
+                }
+            if action == "get_group_list":
+                return {"status": "failed", "retcode": 100, "wording": "暂不可用"}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="request-state-unknown")
+        self.assertFalse(any(a == "set_group_leave" for a, _ in self.bot.calls))
+        self.assertEqual(self.p.history[-1]["outcome"], "error")
+        self.assertIn("matching group request not found", self.p.history[-1]["error"])
+
     async def test_rejection_limit_and_success_reset(self):
         for i in range(3):
             await self.request(flag=str(i))

@@ -323,11 +323,59 @@ class SmartRequestReview(Star):
         ok, data, _ = await self._call(bot, action, **params)
         return unwrap_data(data) if ok else None
 
+    async def _group_membership(self, bot, group_id, attempts=1, delay=0.0):
+        """Return True/False when get_group_list can determine membership.
+
+        A group invite can be consumed by QQ before the request API returns. In
+        that short window the group roster is eventually consistent, so callers
+        reconciling a failed rejection may ask more than once.
+        """
+        target = str(group_id)
+        attempts = max(1, int(attempts or 1))
+        for attempt in range(attempts):
+            data = await self._data(bot, "get_group_list", no_cache=True)
+            if not isinstance(data, list):
+                data = await self._data(bot, "get_group_list")
+            if isinstance(data, list):
+                if any(
+                    isinstance(entry, dict)
+                    and str(entry.get("group_id") or "") == target
+                    for entry in data
+                ):
+                    return True
+                if attempt + 1 < attempts and delay > 0:
+                    await asyncio.sleep(delay)
+                continue
+            if attempt + 1 < attempts and delay > 0:
+                await asyncio.sleep(delay)
+        return False if isinstance(data, list) else None
+
+    async def _leave_joined_group(self, bot, record):
+        group_id = str((record.get("group") or {}).get("group_id") or "")
+        if not group_id.isdigit():
+            return False, "群号未知，无法退出已加入的群"
+        ok, _, error = await self._call(bot, "set_group_leave", group_id=int(group_id))
+        if ok:
+            record["approval_state"] = "rejected_after_join"
+            record["approval_note"] = "机器人已进入目标群，已按拒绝结果退出"
+            return True, ""
+        return False, "已发现机器人在目标群，但退出失败：" + (error or "接口失败")
+
     async def _approve(self, bot, record, approve, reason=""):
         if approve and self._blacklist_reason(record):
             return False, self._blacklist_reason(record)
         if not record.get("flag"):
             return False, "申请缺少 flag"
+        if record["kind"] == "group":
+            joined = await self._group_membership(
+                bot, (record.get("group") or {}).get("group_id")
+            )
+            if joined is True:
+                if approve:
+                    record["approval_state"] = "already_approved"
+                    record["approval_note"] = "机器人已经在目标群"
+                    return True, ""
+                return await self._leave_joined_group(bot, record)
         if record["kind"] == "friend":
             ok, _, error = await self._call(
                 bot, "set_friend_add_request", flag=record["flag"], approve=approve
@@ -348,6 +396,18 @@ class SmartRequestReview(Star):
             record["approval_note"] = error
             record["approval_state"] = "already_approved"
             return True, ""
+        if not ok and record["kind"] == "group" and not approve:
+            # Some adapters consume the invite before returning
+            # "matching group request not found". Re-check membership and
+            # leave the group so a rejected auto-review cannot join silently.
+            joined = await self._group_membership(
+                bot,
+                (record.get("group") or {}).get("group_id"),
+                attempts=4,
+                delay=0.25,
+            )
+            if joined is True:
+                return await self._leave_joined_group(bot, record)
         return ok, error
 
     @staticmethod
@@ -365,6 +425,19 @@ class SmartRequestReview(Star):
     @staticmethod
     def _effective_approve(record, requested):
         return bool(requested or record.get("approval_state") == "already_approved")
+
+    @staticmethod
+    def _outcome_text(record, requested):
+        state = record.get("approval_state")
+        if state == "rejected_after_join":
+            return "已拒绝（已入群，已退出群聊）"
+        if state == "already_approved":
+            if requested:
+                return "已同意（接口提示此前已同意）"
+            return "已同意（接口提示此前已同意，原拒绝未执行）"
+        if record.get("approval_note") and requested:
+            return "已同意（接口提示此前已同意）"
+        return ""
 
     async def _send_segments(
         self, bot, target, text, image=None, fallback_text=None, retry_text=True
@@ -1094,12 +1167,9 @@ class SmartRequestReview(Star):
             if self._effective_approve(record, approve)
             else ("已拒绝并加入本地黑名单" if record["blacklisted"] else "已拒绝")
         )
-        if record.get("approval_note"):
-            outcome = (
-                "已同意（接口提示此前已同意）"
-                if approve
-                else "已同意（接口提示此前已同意，原拒绝未执行）"
-            )
+        outcome_override = self._outcome_text(record, approve)
+        if outcome_override:
+            outcome = outcome_override
         record.update(status="processed", result=outcome, final_reason=reason)
         self._persist_history(record, outcome)
         await self._notify_reviewers(event, record, outcome)
@@ -1311,12 +1381,9 @@ class SmartRequestReview(Star):
                             else "已拒绝"
                         )
                     )
-                    if record.get("approval_note"):
-                        outcome = (
-                            "已同意（接口提示此前已同意）"
-                            if approve
-                            else "已同意（接口提示此前已同意，原拒绝未执行）"
-                        )
+                    outcome_override = self._outcome_text(record, approve)
+                    if outcome_override:
+                        outcome = outcome_override
                     for other in self.pending.values():
                         if self._request_key(other) == self._request_key(record):
                             other.update(
