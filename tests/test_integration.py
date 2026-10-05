@@ -90,6 +90,7 @@ class FakeBot:
         self.mid = 100
         self.fail_approval = False
         self.already_agreed = False
+        self.already_agreed_on_reject = False
         self.fail_image = False
         self.fail_send = False
         self.role = "member"
@@ -107,7 +108,7 @@ class FakeBot:
             if (
                 self.already_agreed
                 and action == "set_group_add_request"
-                and params.get("approve")
+                and (params.get("approve") or self.already_agreed_on_reject)
             ):
                 return {
                     "status": "failed",
@@ -888,6 +889,21 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["status"], "processed")
         self.assertEqual(self.p.history[-1]["outcome"], "已同意（接口提示此前已同意）")
         self.assertIn("approval_note", self.p.history[-1])
+
+    async def test_group_already_agreed_when_auto_would_reject_is_not_failure(self):
+        self.config["mode"] = "auto"
+        self.config["group_blacklist"] = ["22222"]
+        self.bot.already_agreed = True
+        self.bot.already_agreed_on_reject = True
+        await self.request("group", flag="already-agreed-reject", comment="")
+        self.assertEqual(len(self.approvals()), 1)
+        self.assertFalse(self.approvals()[0][1]["approve"])
+        self.assertEqual(
+            self.p.history[-1]["outcome"],
+            "已同意（接口提示此前已同意，原拒绝未执行）",
+        )
+        self.assertEqual(self.p.rejections, {})
+        self.assertNotIn("审批接口失败", str(self.p.history[-1]))
 
     async def test_rejection_limit_and_success_reset(self):
         for i in range(3):

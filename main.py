@@ -341,17 +341,18 @@ class SmartRequestReview(Star):
                 approve=approve,
                 reason=reason if not approve else "",
             )
-        if not ok and self._already_processed_error(error, record, approve):
-            # OneBot/NapCat may report a duplicate invite approval as an error
-            # even though the requested state is already in effect. Treat this
-            # as an idempotent success so it is not retried or shown as failure.
+        if not ok and self._already_processed_error(error, record):
+            # The request can be rejected after the bot has already joined. The
+            # protocol then returns the same 1200 error; the effective state is
+            # still accepted, so do not count a rejection or show an API failure.
             record["approval_note"] = error
+            record["approval_state"] = "already_approved"
             return True, ""
         return ok, error
 
     @staticmethod
-    def _already_processed_error(error, record, approve):
-        if not approve or record.get("kind") != "group":
+    def _already_processed_error(error, record):
+        if record.get("kind") != "group":
             return False
         text = str(error or "").casefold()
         return (
@@ -360,6 +361,10 @@ class SmartRequestReview(Star):
             or "retcode=1200" in text
             or "retcode:1200" in text
         )
+
+    @staticmethod
+    def _effective_approve(record, requested):
+        return bool(requested or record.get("approval_state") == "already_approved")
 
     async def _send_segments(
         self, bot, target, text, image=None, fallback_text=None, retry_text=True
@@ -1078,18 +1083,23 @@ class SmartRequestReview(Star):
                 self._event_bot(event), record, approve, reason
             )
             if ok:
-                self._on_success(record, approve)
+                effective_approve = self._effective_approve(record, approve)
+                self._on_success(record, effective_approve)
         if not ok:
             self._persist_history(record, "error", error=error)
             await self._notify_reviewers(event, record, "审批接口失败", error)
             return
         outcome = (
             "已同意"
-            if approve
+            if self._effective_approve(record, approve)
             else ("已拒绝并加入本地黑名单" if record["blacklisted"] else "已拒绝")
         )
-        if record.get("approval_note") and approve:
-            outcome = "已同意（接口提示此前已同意）"
+        if record.get("approval_note"):
+            outcome = (
+                "已同意（接口提示此前已同意）"
+                if approve
+                else "已同意（接口提示此前已同意，原拒绝未执行）"
+            )
         record.update(status="processed", result=outcome, final_reason=reason)
         self._persist_history(record, outcome)
         await self._notify_reviewers(event, record, outcome)
@@ -1286,18 +1296,27 @@ class SmartRequestReview(Star):
                 )
                 if ok:
                     record["manual_reason"] = reason
-                    self._on_success(record, approve, force_block=action == "拉黑")
+                    effective_approve = self._effective_approve(record, approve)
+                    self._on_success(
+                        record,
+                        effective_approve,
+                        force_block=action == "拉黑" and not effective_approve,
+                    )
                     outcome = (
                         "已同意"
-                        if approve
+                        if effective_approve
                         else (
                             "已拒绝并加入本地黑名单"
                             if record["blacklisted"]
                             else "已拒绝"
                         )
                     )
-                    if record.get("approval_note") and approve:
-                        outcome = "已同意（接口提示此前已同意）"
+                    if record.get("approval_note"):
+                        outcome = (
+                            "已同意（接口提示此前已同意）"
+                            if approve
+                            else "已同意（接口提示此前已同意，原拒绝未执行）"
+                        )
                     for other in self.pending.values():
                         if self._request_key(other) == self._request_key(record):
                             other.update(
