@@ -310,14 +310,24 @@ class SmartRequestReview(Star):
             if result.get("status") == "failed" or (
                 "retcode" in result and as_int(result["retcode"], -1) != 0
             ):
-                return (
-                    False,
-                    result.get("data"),
-                    str(result.get("wording") or result.get("message") or "接口失败"),
-                )
+                return False, result.get("data"), self._failure_detail(result)
             if "data" in result and ("status" in result or "retcode" in result):
                 result = result["data"]
         return True, result, ""
+
+    @staticmethod
+    def _failure_detail(result):
+        """Read the failure reason wherever this OneBot implementation puts it.
+
+        go-cqhttp/NapCat report it in ``msg``, others in ``wording`` or
+        ``message``. Dropping ``msg`` hides idempotent results such as
+        "already agree msg by self" and reports a false API failure.
+        """
+        for key in ("wording", "msg", "message"):
+            detail = as_text(result.get(key))
+            if detail:
+                return detail
+        return "接口失败"
 
     async def _data(self, bot, action, **params):
         ok, data, _ = await self._call(bot, action, **params)
@@ -925,8 +935,16 @@ class SmartRequestReview(Star):
                 f"申请人：{name('nickname')}（QQ号 {self._display_id(p.get('user_id') or record.get('subject_id'))}）"
             )
         lines.append(f"{suggestion}：{conclusion['reason']}")
-        if record.get("approval_note"):
+        approval_state = record.get("approval_state")
+        if approval_state == "already_approved":
             lines.append("接口提示：此前已同意，本次按已同意处理")
+        elif approval_state == "rejected_after_join":
+            lines.append(
+                "接口提示："
+                + as_text(
+                    record.get("approval_note"), "机器人已进入目标群，已按拒绝结果退出"
+                )
+            )
         if record.get("manual_reason"):
             lines.append("人工理由：" + record["manual_reason"][:100])
         if full:

@@ -968,6 +968,69 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p.history[-1]["outcome"], "error")
         self.assertIn("matching group request not found", self.p.history[-1]["error"])
 
+    async def test_already_agreed_detected_when_adapter_reports_reason_in_msg(self):
+        """NapCat-style failures put the reason in msg, not wording/message."""
+        self.config.update(mode="auto", group_allowlist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "set_group_add_request":
+                self.bot.calls.append((action, copy.deepcopy(params)))
+                return {
+                    "status": "failed",
+                    "retcode": 1200,
+                    "data": None,
+                    "msg": "already agree msg by self",
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="already-agreed-in-msg")
+        self.assertEqual(len(self.approvals()), 1)
+        self.assertTrue(self.approvals()[0][1]["approve"])
+        self.assertEqual(self.p.history[-1]["outcome"], "已同意（接口提示此前已同意）")
+        self.assertEqual(self.p.rejections, {})
+        self.assertNotIn("审批接口失败", str(self.p.history[-1]))
+
+    async def test_auto_reject_after_join_never_claims_previously_approved(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_list":
+                return {"status": "ok", "retcode": 0, "data": [{"group_id": 22222}]}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="already-joined-note")
+        record = self.p.history[-1]
+        self.assertEqual(record["outcome"], "已拒绝（已入群，已退出群聊）")
+        text = self.p._report(record, record["outcome"])
+        self.assertIn("已退出群聊", text)
+        self.assertNotIn("此前已同意", text)
+        sent = [
+            segment["data"]["text"]
+            for action, params in self.bot.calls
+            if action == "send_group_msg"
+            for segment in params["message"]
+            if segment["type"] == "text"
+        ]
+        self.assertTrue(sent)
+        self.assertTrue(all("此前已同意" not in item for item in sent))
+
+    async def test_already_approved_report_keeps_previously_approved_note(self):
+        self.bot.already_agreed = True
+        await self.request("group", flag="already-approved-note")
+        record = self.pending()
+        await collect(
+            self.p._handle_command(
+                Event(self.bot, reply=record["message_id"], text="同意"), "同意"
+            )
+        )
+        text = self.p._report(self.p.history[-1], "已同意（接口提示此前已同意）")
+        self.assertIn("此前已同意", text)
+        self.assertNotIn("已退出群聊", text)
+
     async def test_rejection_limit_and_success_reset(self):
         for i in range(3):
             await self.request(flag=str(i))
