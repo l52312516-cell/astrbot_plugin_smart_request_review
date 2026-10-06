@@ -84,6 +84,12 @@
       "step": 1
     }
   },
+  "auto_manual_fallback": {
+    "description": "全自动无资料时转人工",
+    "type": "bool",
+    "default": true,
+    "hint": "全自动模式下，若已完成评分的项目即使全部拿满分也达不到通过阈值（资料未获取、模型不可用或评分项关闭导致无法自动判断），则不自动拒绝，改为发出待审批卡片等待人工决定。命中本地黑名单、拒绝关键词或未命中白名单时仍按规则自动执行。"
+  },
   "pending_expire_hours": {
     "description": "待审批有效期（小时）",
     "type": "int",
@@ -173,26 +179,6 @@
     "type": "int",
     "default": 2
   },
-  "group_level_threshold": {
-    "description": "群等级起评分数",
-    "type": "int",
-    "default": 1
-  },
-  "group_level_high_threshold": {
-    "description": "群等级高分阈值",
-    "type": "int",
-    "default": 5
-  },
-  "group_level_one_point": {
-    "description": "群达到起始等级的分数",
-    "type": "int",
-    "default": 1
-  },
-  "group_level_two_points": {
-    "description": "群达到高等级的分数",
-    "type": "int",
-    "default": 1
-  },
   "group_member_min": {
     "description": "群人数评分下限",
     "type": "int",
@@ -233,16 +219,6 @@
     "type": "string",
     "default": "请根据群名、群备注和群简介判断群是否符合审核目标。"
   },
-  "group_comment_prompt": {
-    "description": "群邀请验证信息提示词",
-    "type": "string",
-    "default": "请判断群邀请验证信息是否具体、真实、合理。"
-  },
-  "group_text_prompt": {
-    "description": "群简介评分提示词",
-    "type": "string",
-    "default": "根据标准群资料中的群简介判断是否适合动漫、二次元兴趣交流。没有实质内容不得加分。"
-  },
   "friend_score_threshold": {
     "description": "好友申请通过阈值",
     "type": "int",
@@ -257,8 +233,8 @@
   "group_score_threshold": {
     "description": "群聊邀请通过阈值",
     "type": "int",
-    "default": -1,
-    "hint": "-1 继承旧版统一阈值（默认5）；0到10为独立阈值。",
+    "default": 3,
+    "hint": "默认 3（群邀请启用项合计 5 分：群资料特征 3、群人数 2）；-1 继承统一阈值，0到10 为独立阈值。",
     "slider": {
       "min": -1,
       "max": 10,
@@ -382,21 +358,6 @@
       "step": 1
     }
   },
-  "group_comment_enabled": {
-    "description": "启用邀请验证信息评分",
-    "type": "bool",
-    "default": true
-  },
-  "group_comment_max_score": {
-    "description": "邀请验证信息最高分",
-    "type": "int",
-    "default": 2,
-    "slider": {
-      "min": 0,
-      "max": 10,
-      "step": 1
-    }
-  },
   "group_member_enabled": {
     "description": "启用群人数评分",
     "type": "bool",
@@ -404,36 +365,6 @@
   },
   "group_member_max_score": {
     "description": "群人数最高分",
-    "type": "int",
-    "default": 2,
-    "slider": {
-      "min": 0,
-      "max": 10,
-      "step": 1
-    }
-  },
-  "group_level_enabled": {
-    "description": "启用群等级评分",
-    "type": "bool",
-    "default": true
-  },
-  "group_level_max_score": {
-    "description": "群等级最高分",
-    "type": "int",
-    "default": 1,
-    "slider": {
-      "min": 0,
-      "max": 10,
-      "step": 1
-    }
-  },
-  "group_text_enabled": {
-    "description": "启用群简介评分",
-    "type": "bool",
-    "default": true
-  },
-  "group_text_max_score": {
-    "description": "群简介最高分",
     "type": "int",
     "default": 2,
     "slider": {

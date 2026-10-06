@@ -80,7 +80,7 @@ package.__path__ = [str(ROOT)]
 sys.modules["review_under_test"] = package
 plugin = importlib.import_module("review_under_test.main")
 from review_under_test.core.providers import ProviderSelector
-from review_under_test.core.scoring import model_result, summary
+from review_under_test.core.scoring import model_result, possible_total, summary
 from review_under_test.core.renderer import ReviewCardRenderer, lines_for
 
 
@@ -362,7 +362,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(info["member_count"])
         self.assertIsNone(info["honor"])
         scores = {v["key"]: v for v in record["items"]}
-        for key in ("group_level", "group_member", "group_text"):
+        self.assertEqual(set(scores), {"group_profile", "group_member"})
+        for key in ("group_profile", "group_member"):
             self.assertEqual(scores[key]["state"], "unknown")
         text = self.p._report(record)
         self.assertNotIn("群名称：", text)
@@ -410,14 +411,16 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         record = self.pending()
         scores = {v["key"]: v for v in record["items"]}
         self.assertEqual(scores["group_member"]["score"], 2)
-        self.assertEqual(scores["group_level"]["score"], 1)
+        self.assertEqual(set(scores), {"group_profile", "group_member"})
         prompts = "\n".join(
             c.kwargs["prompt"] for c in self.context.llm_generate.call_args_list
         )
         self.assertIn("标准接口群名", prompts)
         self.assertIn("标准群简介", prompts)
-        self.assertIn("希望一起交流", prompts)
         self.assertIn("群名称：标准接口群名", self.p._report(record))
+        full = self.p._report(record, full=True)
+        self.assertIn(f"总分 {record['score']}/5", full)
+        self.assertIn(f"总分 {record['score']}/{possible_total(record)}", full)
 
     async def test_brief_identity_and_hide_unavailable_fields(self):
         await self.request()
@@ -572,6 +575,154 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             next(x for x in r["items"] if x["key"] == "friend_avatar")["state"],
             "disabled",
         )
+
+    async def test_stranger_partial_payload_triggers_no_cache_retry(self):
+        """Nickname present but level/signature missing must still retry."""
+        original = self.bot.call_action
+        calls = []
+
+        async def call(action, **params):
+            if action == "get_stranger_info":
+                calls.append(params)
+                if params.get("no_cache"):
+                    return {
+                        "nickname": "二次元爱好者",
+                        "qqLevel": 42,
+                        "long_nick": "动漫交流",
+                    }
+                return {"nickname": "二次元爱好者"}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("friend", flag="partial-stranger")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[1].get("no_cache"))
+        record = self.pending()
+        self.assertEqual(record["profile"]["nickname"], "二次元爱好者")
+        self.assertEqual(record["profile"]["level"], 42)
+        self.assertEqual(record["profile"]["signature"], "动漫交流")
+
+    async def test_stranger_complete_payload_skips_retry(self):
+        original = self.bot.call_action
+        calls = []
+
+        async def call(action, **params):
+            if action == "get_stranger_info":
+                calls.append(params)
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("friend", flag="complete-stranger")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0].get("no_cache"))
+
+    async def test_auto_no_data_escalates_to_manual(self):
+        """A group the bot has not joined returns no profile; do not auto-reject it."""
+        self.config.update(mode="auto", group_score_threshold=6)
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"get_group_info", "get_stranger_info"}:
+                return {}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="no-data", comment="")
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.p.rejections, {})
+        record = self.pending()
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["score"], 0)
+        self.assertTrue(all(x["state"] != "scored" for x in record["items"]))
+        report = self.p._report(record)
+        self.assertIn("自动兜底", report)
+        self.assertIn("需人工判断", report)
+        self.assertNotIn("建议拒绝", report)
+        self.assertTrue(any(a == "send_group_msg" for a, _ in self.bot.calls))
+
+    async def test_auto_no_data_fallback_covers_friend_requests(self):
+        self.config.update(mode="auto")
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_stranger_info":
+                return {}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("friend", flag="no-data-friend", comment="")
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.pending()["status"], "pending")
+
+    async def test_auto_real_zero_scores_still_rejected(self):
+        """Fully available data scored at 0 is a verdict, not missing data."""
+        self.config.update(mode="auto", group_score_threshold=4)
+        self.context.llm_generate.return_value = types.SimpleNamespace(
+            completion_text='{"score":0,"hit":false,"tags":[],"reason":"不符合"}'
+        )
+        await self.request("group", flag="scored-zero", comment="随便加一下")
+        self.assertEqual(self.p.pending, {})
+        approvals = self.approvals()
+        self.assertEqual(len(approvals), 1)
+        self.assertFalse(approvals[0][1]["approve"])
+        self.assertEqual(self.p.history[-1]["outcome"], "已拒绝")
+        states = {x["key"]: x["state"] for x in self.p.history[-1]["items"]}
+        self.assertEqual(states["group_profile"], "scored")
+        self.assertEqual(states["group_member"], "scored")
+
+    async def test_auto_sparse_profile_escalates_to_manual(self):
+        """Friend verification text always arrives with the event, so that total is
+        not 0 -- yet the few evaluated items cannot reach the threshold."""
+        self.config.update(mode="auto")
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"get_group_info", "get_stranger_info"}:
+                return {}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        for kind, expected in (("group", 0), ("friend", 3)):
+            await self.request(kind, flag=f"sparse-{kind}", comment="一起交流")
+            record = next(
+                v for v in self.p.pending.values() if v["flag"] == f"sparse-{kind}"
+            )
+            self.assertEqual(record["score"], expected)
+            self.assertEqual(record["status"], "pending")
+            self.assertIn("需人工判断", self.p._report(record))
+        self.assertEqual(self.approvals(), [])
+
+    async def test_auto_hard_rule_still_executes_without_data(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"get_group_info", "get_stranger_info"}:
+                return {}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="no-data-hard-rule", comment="")
+        self.assertEqual(self.p.pending, {})
+        approvals = self.approvals()
+        self.assertEqual(len(approvals), 1)
+        self.assertFalse(approvals[0][1]["approve"])
+
+    async def test_auto_fallback_can_be_disabled(self):
+        self.config.update(mode="auto", auto_manual_fallback=False)
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"get_group_info", "get_stranger_info"}:
+                return {}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="no-data-disabled", comment="")
+        self.assertEqual(self.p.pending, {})
+        approvals = self.approvals()
+        self.assertEqual(len(approvals), 1)
+        self.assertFalse(approvals[0][1]["approve"])
 
     async def test_json_failure_and_timeout_and_vision_error(self):
         for response in (
@@ -1255,6 +1406,23 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(schema["group_member_max"]["default"], 999999)
         self.assertEqual(schema["group_member_max_score"]["default"], 2)
         self.assertEqual(schema["friend_score_threshold"]["default"], -1)
+        self.assertEqual(schema["group_score_threshold"]["default"], 3)
+        self.assertTrue(schema["auto_manual_fallback"]["default"])
+        for removed in (
+            "group_comment_enabled",
+            "group_comment_max_score",
+            "group_comment_prompt",
+            "group_level_enabled",
+            "group_level_max_score",
+            "group_level_threshold",
+            "group_level_high_threshold",
+            "group_level_one_point",
+            "group_level_two_points",
+            "group_text_enabled",
+            "group_text_max_score",
+            "group_text_prompt",
+        ):
+            self.assertNotIn(removed, schema)
         for key in ("provider_id", "vision_provider_id"):
             self.assertEqual(schema[key]["_special"], "select_provider")
 
@@ -1269,6 +1437,34 @@ class UnitTests(unittest.TestCase):
         r["score"] = 4
         self.assertEqual(summary(r, 3)["action"], "block")
         self.assertIn("3 次", summary(r, 3)["reason"])
+
+    def test_possible_total_tracks_enabled_items(self):
+        """Cards must not print a denominator nobody can reach."""
+        self.assertEqual(
+            possible_total(
+                {
+                    "items": [
+                        {"max": 3, "state": "unknown"},
+                        {"max": 2, "state": "scored"},
+                        {"max": 1, "state": "disabled"},
+                        {"max": 2, "state": "scored"},
+                    ]
+                }
+            ),
+            7,
+        )
+        self.assertEqual(possible_total({"items": []}), 10)
+        self.assertEqual(
+            possible_total(
+                {
+                    "items": [
+                        {"max": 6, "state": "scored"},
+                        {"max": 6, "state": "scored"},
+                    ]
+                }
+            ),
+            10,
+        )
 
     def test_strict_model_and_cap(self):
         self.assertEqual(
@@ -1312,6 +1508,8 @@ class UnitTests(unittest.TestCase):
                 ],
                 "recommendation": {"action": "reject", "reason": "资料不足" * 30},
                 "missing": ["接口失败" * 40],
+                "escalation": "未获取到可用于评分的资料（总分 0），转人工判断",
+                "status": "pending",
             }
             data = render.render(p)
             with Image.open(io.BytesIO(data)) as image:

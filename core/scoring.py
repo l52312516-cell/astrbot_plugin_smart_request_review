@@ -18,10 +18,7 @@ SCORE_SPECS = {
     ],
     "group": [
         ("group_profile", "群资料特征", 3),
-        ("group_comment", "邀请验证信息", 2),
         ("group_member", "群人数", 2),
-        ("group_level", "群等级", 1),
-        ("group_text", "群简介", 2),
     ],
 }
 
@@ -95,6 +92,23 @@ def item(
         "tags": tags or [],
         "provider_id": provider_id,
     }
+
+
+def possible_total(record: dict[str, Any]) -> int:
+    """Highest score this record can reach with the items that are enabled.
+
+    A request type with fewer enabled items tops out lower (group invites total
+    8 after the invite-comment item was removed), so cards and reports must not
+    print a denominator nobody can reach. Disabled items are not achievable and
+    are excluded; the documented 10 point cap still applies.
+    """
+    items = record.get("items") or []
+    reachable = sum(
+        int(x.get("max", 0)) for x in items if x.get("state") != "disabled"
+    )
+    if reachable <= 0:
+        return 10
+    return min(10, reachable)
 
 
 def summary(record: dict[str, Any], limit: int) -> dict[str, str]:

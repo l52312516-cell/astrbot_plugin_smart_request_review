@@ -8,6 +8,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from .profiles import meaningful
+from .scoring import possible_total
 
 RESOURCE_DIR = Path(__file__).resolve().parent / "resource"
 STATE_NAMES = {
@@ -148,7 +149,7 @@ class ReviewCardRenderer:
             (
                 "评分未执行 · 硬规则决定结果"
                 if skipped
-                else f"总分  {total} / 10     通过阈值  {record.get('threshold', 5)}"
+                else f"总分  {total} / {possible_total(record)}     通过阈值  {record.get('threshold', 5)}"
             ),
             34,
             "#173f68",
@@ -197,8 +198,13 @@ class ReviewCardRenderer:
             action
         ]
         color = COLORS[action]
+        if record.get("escalation") and record.get("status") == "pending":
+            # Nothing was scored, so no data-backed verdict may be presented.
+            label, color = "需人工判断", "#ad5e08"
         section("最终结论")
         add(f"{label}：{conclusion['reason']}", 32, color, 3)
+        if record.get("escalation"):
+            add("自动兜底：" + str(record["escalation"]), 26, "#ad5e08", 3)
         if outcome != "待审批":
             add("执行结果：" + outcome, 29, "#224c77", 2)
         else:

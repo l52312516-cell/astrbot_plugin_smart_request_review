@@ -48,7 +48,7 @@ except ImportError:
             return None
 
 
-from .core.scoring import SCORE_SPECS, model_result, item, summary
+from .core.scoring import SCORE_SPECS, model_result, item, possible_total, summary
 from .core.storage import JsonStore
 
 PLUGIN_NAME = "astrbot_plugin_smart_request_review"
@@ -559,11 +559,31 @@ class SmartRequestReview(Star):
             except OSError:
                 pass
 
+    @staticmethod
+    def _stranger_fields(raw):
+        """The three stranger fields the review actually scores."""
+        return (
+            first_value(raw, "nickname", "nick", "name", default=None),
+            first_value(raw, "qqLevel", "level", "qlevel", default=None),
+            first_value(
+                raw, "long_nick", "longNick", "long_nickname", "signature", default=None
+            ),
+        )
+
+    @classmethod
+    def _stranger_incomplete(cls, raw):
+        """A nickname-only payload is common: level and signature are served from
+        the local detail card, and adapters can answer more completely from
+        another source when asked without cache (NapCat switches KDB -> KSERVER).
+        Retry on any missing field, not only on a missing nickname.
+        """
+        return not all(meaningful(value) for value in cls._stranger_fields(raw))
+
     async def _friend_profile(self, bot, user_id, comment):
         ok, raw, error = await self._call(
             bot, "get_stranger_info", user_id=int(user_id)
         )
-        if not ok or not isinstance(raw, dict) or not meaningful(raw.get("nickname")):
+        if not ok or not isinstance(raw, dict) or self._stranger_incomplete(raw):
             original = raw if ok and isinstance(raw, dict) else {}
             ok, raw, error = await self._call(
                 bot, "get_stranger_info", user_id=int(user_id), no_cache=True
@@ -573,13 +593,12 @@ class SmartRequestReview(Star):
                 **{k: v for k, v in original.items() if meaningful(v)},
             }
         raw = raw if isinstance(raw, dict) else {}
+        nickname, level, signature = self._stranger_fields(raw)
         profile = {
             "user_id": user_id,
-            "nickname": first_value(raw, "nickname", "nick", "name", default=None),
-            "level": first_value(raw, "qqLevel", "level", "qlevel", default=None),
-            "signature": first_value(
-                raw, "long_nick", "longNick", "long_nickname", "signature", default=None
-            ),
+            "nickname": nickname,
+            "level": level,
+            "signature": signature,
             "sex": raw.get("sex"),
             "age": raw.get("age"),
             "area": " ".join(
@@ -666,17 +685,11 @@ class SmartRequestReview(Star):
             0, min(10, as_int(self.cfg(f"{key}_max_score", maximum), maximum))
         )
 
-    def _level_score(self, kind, level, maximum):
-        start = as_int(
-            self.cfg(f"{kind}_level_threshold", 15 if kind == "friend" else 1)
-        )
-        high = as_int(
-            self.cfg(f"{kind}_level_high_threshold", 30 if kind == "friend" else 5)
-        )
-        low_points = as_int(self.cfg(f"{kind}_level_one_point", 1))
-        high_points = as_int(
-            self.cfg(f"{kind}_level_two_points", 2 if kind == "friend" else 1)
-        )
+    def _friend_level_score(self, level, maximum):
+        start = as_int(self.cfg("friend_level_threshold", 15))
+        high = as_int(self.cfg("friend_level_high_threshold", 30))
+        low_points = as_int(self.cfg("friend_level_one_point", 1))
+        high_points = as_int(self.cfg("friend_level_two_points", 2))
         return min(
             maximum,
             score_level(level, start, max(high, start), low_points, high_points),
@@ -754,13 +767,13 @@ class SmartRequestReview(Star):
                     )
                 )
                 continue
-            if key in {"friend_level", "group_level"}:
+            if key == "friend_level":
                 value = p.get("level")
                 if value is None or value == "" or as_int(value, -1) < 0:
                     scored = {"score": 0, "state": "unknown", "reason": "等级未知"}
                 else:
                     scored = {
-                        "score": self._level_score(kind, value, maximum),
+                        "score": self._friend_level_score(value, maximum),
                         "state": "scored",
                         "reason": f"等级 {value}，按配置阈值计分",
                     }
@@ -806,8 +819,6 @@ class SmartRequestReview(Star):
                     data, image = {
                         k: p.get(k) for k in ("name", "remark", "memo")
                     }, None
-                elif key == "group_text":
-                    data, image = {"memo": p.get("memo")}, None
                 else:
                     data, image = (
                         p.get(
@@ -815,7 +826,6 @@ class SmartRequestReview(Star):
                                 "friend_verification": "comment",
                                 "friend_nickname": "nickname",
                                 "friend_signature": "signature",
-                                "group_comment": "comment",
                             }[key]
                         ),
                         None,
@@ -914,6 +924,8 @@ class SmartRequestReview(Star):
         suggestion = {"approve": "建议同意", "reject": "建议拒绝", "block": "建议拉黑"}[
             conclusion["action"]
         ]
+        if record.get("escalation") and record.get("status") == "pending":
+            suggestion = "需人工判断"
         p = record.get("profile") or record.get("group") or {}
 
         def name(key):
@@ -935,6 +947,8 @@ class SmartRequestReview(Star):
                 f"申请人：{name('nickname')}（QQ号 {self._display_id(p.get('user_id') or record.get('subject_id'))}）"
             )
         lines.append(f"{suggestion}：{conclusion['reason']}")
+        if record.get("escalation"):
+            lines.append("自动兜底：" + as_text(record["escalation"]))
         approval_state = record.get("approval_state")
         if approval_state == "already_approved":
             lines.append("接口提示：此前已同意，本次按已同意处理")
@@ -982,7 +996,7 @@ class SmartRequestReview(Star):
                 lines.append(f"{label}：{text[:180]}")
             lines += [
                 f"硬规则：{record['hard_rule']['reason']}",
-                f"总分 {record['score']}/10，阈值 {record['threshold']}",
+                f"总分 {record['score']}/{possible_total(record)}，阈值 {record['threshold']}",
             ]
             lines += [
                 f"{x['name']} {x['score']}/{x['max']} ({x['state']})：{x['reason'][:100]}"
@@ -1053,6 +1067,28 @@ class SmartRequestReview(Star):
             snapshot["error"] = error
         self.history.append(snapshot)
         self._save_state()
+
+    def _needs_manual_fallback(self, record):
+        """Auto mode must not reject on data it never obtained.
+
+        Standard stranger/group APIs return nothing for a group the bot has not
+        joined yet and for restricted profiles, so those items stay unknown.
+        When even a perfect score on every item that *was* evaluated cannot
+        reach the threshold, the rejection would be driven by missing data
+        rather than by the applicant, so a reviewer decides instead. Hard rules
+        (local blacklist, keywords, allowlist) are still executed directly, and
+        fully evaluated requests keep their automatic decision.
+        """
+        if not self.cfg("auto_manual_fallback", True):
+            return False
+        if (record.get("hard_rule") or {}).get("action") != "score":
+            return False
+        reachable = sum(
+            int(x.get("max", 0))
+            for x in record.get("items") or []
+            if x.get("state") == "scored"
+        )
+        return reachable < int(record.get("threshold", 0))
 
     async def _process_request(self, event, raw):
         request_type, subtype = raw.get("request_type"), raw.get("sub_type")
@@ -1135,6 +1171,12 @@ class SmartRequestReview(Star):
                 approve = action == "approve" or (
                     action == "score" and record["score"] >= record["threshold"]
                 )
+                if not approve and self._needs_manual_fallback(record):
+                    record["escalation"] = (
+                        "未获取到可用于评分的资料（总分 0），转人工判断"
+                    )
+                    await self._queue_pending(event, record)
+                    return
                 await self._finish_auto(
                     event, record, approve, record["recommendation"]["reason"]
                 )
