@@ -1068,27 +1068,31 @@ class SmartRequestReview(Star):
         self.history.append(snapshot)
         self._save_state()
 
-    def _needs_manual_fallback(self, record):
-        """Auto mode must not reject on data it never obtained.
+    def _manual_fallback_reason(self, record):
+        """Why auto mode cannot judge this request, or "" when it can.
 
         Standard stranger/group APIs return nothing for a group the bot has not
-        joined yet and for restricted profiles, so those items stay unknown.
-        When even a perfect score on every item that *was* evaluated cannot
-        reach the threshold, the rejection would be driven by missing data
-        rather than by the applicant, so a reviewer decides instead. Hard rules
-        (local blacklist, keywords, allowlist) are still executed directly, and
-        fully evaluated requests keep their automatic decision.
+        joined yet and for restricted profiles, and a model call can also fail,
+        so some items stay unknown. When even a perfect score on every item that
+        *was* evaluated cannot reach the threshold, the verdict would come from
+        unavailable data rather than from the applicant, so a reviewer decides.
+        Hard rules (local blacklist, keywords, allowlist) are still executed
+        directly, and fully evaluated requests keep their automatic decision.
         """
         if not self.cfg("auto_manual_fallback", True):
-            return False
+            return ""
         if (record.get("hard_rule") or {}).get("action") != "score":
-            return False
-        reachable = sum(
-            int(x.get("max", 0))
-            for x in record.get("items") or []
-            if x.get("state") == "scored"
+            return ""
+        items = record.get("items") or []
+        scored = [x for x in items if x.get("state") == "scored"]
+        reachable = sum(int(x.get("max", 0)) for x in scored)
+        threshold = int(record.get("threshold", 0))
+        if reachable >= threshold:
+            return ""
+        return (
+            f"自动判断依据不足：{len(scored)}/{len(items)} 项完成评分，"
+            f"可得最高分 {reachable} < 通过阈值 {threshold}，转人工判断"
         )
-        return reachable < int(record.get("threshold", 0))
 
     async def _process_request(self, event, raw):
         request_type, subtype = raw.get("request_type"), raw.get("sub_type")
@@ -1171,10 +1175,9 @@ class SmartRequestReview(Star):
                 approve = action == "approve" or (
                     action == "score" and record["score"] >= record["threshold"]
                 )
-                if not approve and self._needs_manual_fallback(record):
-                    record["escalation"] = (
-                        "未获取到可用于评分的资料（总分 0），转人工判断"
-                    )
+                fallback = self._manual_fallback_reason(record)
+                if not approve and fallback:
+                    record["escalation"] = fallback
                     await self._queue_pending(event, record)
                     return
                 await self._finish_auto(

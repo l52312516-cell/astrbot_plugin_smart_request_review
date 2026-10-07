@@ -4,7 +4,7 @@ short_desc: 使用规则和大模型自动或半自动审核好友申请、群�
 desc: |
   监听 aiocqhttp 的好友申请和群邀请，先执行黑名单、白名单、关键词等确定性规则，
   再按需调用 AstrBot 当前配置的大模型进行判断。支持全自动执行和半自动提交管理员审批。
-version: 1.1.11
+version: 1.1.12
 author: l52312516-cell
 repo: https://github.com/l52312516-cell/astrbot_plugin_smart_request_review
 astrbot_version: ">=4.12"

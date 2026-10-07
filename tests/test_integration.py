@@ -682,14 +682,20 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             return await original(action, **params)
 
         self.bot.call_action = call
-        for kind, expected in (("group", 0), ("friend", 3)):
+        for kind, expected, note in (
+            ("group", 0, "0/2 项完成评分，可得最高分 0 < 通过阈值 5"),
+            ("friend", 3, "2/6 项完成评分，可得最高分 4 < 通过阈值 5"),
+        ):
             await self.request(kind, flag=f"sparse-{kind}", comment="一起交流")
             record = next(
                 v for v in self.p.pending.values() if v["flag"] == f"sparse-{kind}"
             )
             self.assertEqual(record["score"], expected)
             self.assertEqual(record["status"], "pending")
-            self.assertIn("需人工判断", self.p._report(record))
+            self.assertIn(note, record["escalation"])
+            report = self.p._report(record)
+            self.assertIn("需人工判断", report)
+            self.assertNotIn("总分 0", report)
         self.assertEqual(self.approvals(), [])
 
     async def test_auto_hard_rule_still_executes_without_data(self):
@@ -1508,7 +1514,7 @@ class UnitTests(unittest.TestCase):
                 ],
                 "recommendation": {"action": "reject", "reason": "资料不足" * 30},
                 "missing": ["接口失败" * 40],
-                "escalation": "未获取到可用于评分的资料（总分 0），转人工判断",
+                "escalation": "自动判断依据不足：2/6 项完成评分，可得最高分 4 < 通过阈值 6，转人工判断",
                 "status": "pending",
             }
             data = render.render(p)
