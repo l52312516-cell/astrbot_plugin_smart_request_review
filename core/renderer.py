@@ -8,7 +8,12 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from .profiles import meaningful
-from .scoring import possible_total
+from .scoring import (
+    MANUAL_COLOR,
+    conclusion_label,
+    escalation_line,
+    possible_total,
+)
 
 RESOURCE_DIR = Path(__file__).resolve().parent / "resource"
 STATE_NAMES = {
@@ -17,7 +22,6 @@ STATE_NAMES = {
     "disabled": "已关闭",
     "skipped": "硬规则跳过",
 }
-COLORS = {"approve": "#087f5b", "reject": "#c23b40", "block": "#ad5e08"}
 
 
 @lru_cache(maxsize=12)
@@ -114,18 +118,6 @@ class ReviewCardRenderer:
                 ),
                 ("验证信息", p.get("comment")),
                 ("群简介", p.get("memo")),
-                (
-                    "群主 / 管理员",
-                    "、".join(
-                        str(x.get("card") or x.get("nickname") or "未知")
-                        for x in p.get("admins", [])
-                        if isinstance(x, dict)
-                    )
-                    or None,
-                ),
-                ("公告摘要", p.get("notices")),
-                ("精华摘要", p.get("essence")),
-                ("荣誉摘要", p.get("honor")),
             ]
         )
         section("申请资料")
@@ -190,21 +182,16 @@ class ReviewCardRenderer:
             add("执行失败：" + error, 25, "#c23b40", 3)
         if record.get("manual_reason"):
             add("人工理由：" + record["manual_reason"], 25, "#44576a", 3)
-        conclusion = record.get(
-            "recommendation", {"action": "reject", "reason": "待判断"}
-        )
-        action = conclusion["action"]
-        label = {"approve": "建议同意", "reject": "建议拒绝", "block": "建议拉黑"}[
-            action
-        ]
-        color = COLORS[action]
-        if record.get("escalation") and record.get("status") == "pending":
-            # Nothing was scored, so no data-backed verdict may be presented.
-            label, color = "需人工判断", "#ad5e08"
+        conclusion = record.get("recommendation") or {
+            "action": "reject",
+            "reason": "待判断",
+        }
+        label, color = conclusion_label(record)
         section("最终结论")
         add(f"{label}：{conclusion['reason']}", 32, color, 3)
-        if record.get("escalation"):
-            add("自动兜底：" + str(record["escalation"]), 26, "#ad5e08", 3)
+        escalation = escalation_line(record)
+        if escalation:
+            add(escalation, 26, MANUAL_COLOR, 3)
         if outcome != "待审批":
             add("执行结果：" + outcome, 29, "#224c77", 2)
         else:

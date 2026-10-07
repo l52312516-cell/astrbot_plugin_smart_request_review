@@ -100,6 +100,17 @@
       "step": 1
     }
   },
+  "history_limit": {
+    "description": "历史与来源记录保留条数",
+    "type": "int",
+    "default": 2000,
+    "slider": {
+      "min": 100,
+      "max": 100000,
+      "step": 100
+    },
+    "hint": "history.json 与 blacklist.json 的来源记录只保留最新 N 条，避免长期运行后文件无限增长。"
+  },
   "review_session": {
     "description": "审核会话",
     "type": "string",

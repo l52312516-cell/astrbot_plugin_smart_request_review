@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 
 class ProviderSelector:
     """Discover AstrBot chat providers and resolve configured selections."""
 
-    def __init__(self, context: Any, config: Any, schema_path: Path):
+    def __init__(self, context: Any, config: Any):
         self.context = context
         self.config = config
-        self.schema_path = schema_path
         self.entries: list[tuple[str, str]] = []
 
     def _all(self) -> list[Any]:
@@ -30,6 +27,12 @@ class ProviderSelector:
             return []
 
     def refresh(self) -> list[tuple[str, str]]:
+        """Rebuild the option list for the config panel.
+
+        This only touches the in-memory ``config.schema``; AstrBot reads
+        `_conf_schema.json` once when it loads the plugin, so the packaged file
+        is never rewritten at runtime.
+        """
         seen: set[str] = set()
         result: list[tuple[str, str]] = []
         for provider in self._all():
@@ -71,18 +74,6 @@ class ProviderSelector:
                     if isinstance(schema.get(key), dict):
                         schema[key]["options"] = options
                         schema[key]["labels"] = labels
-        except Exception:
-            pass
-        try:
-            data = json.loads(self.schema_path.read_text(encoding="utf-8"))
-            for key in ("provider_id", "vision_provider_id"):
-                data.setdefault(key, {})["options"] = options
-                data.setdefault(key, {})["labels"] = labels
-            rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-            if self.schema_path.read_text(encoding="utf-8") != rendered:
-                temporary = self.schema_path.with_suffix(".json.tmp")
-                temporary.write_text(rendered, encoding="utf-8")
-                temporary.replace(self.schema_path)
         except Exception:
             pass
         return result

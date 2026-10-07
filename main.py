@@ -5,11 +5,9 @@ import base64
 import copy
 import inspect
 import hashlib
-import json
 import re
 import time
 from pathlib import Path
-from typing import Any, AsyncGenerator
 
 try:
     import aiohttp
@@ -48,7 +46,15 @@ except ImportError:
             return None
 
 
-from .core.scoring import SCORE_SPECS, model_result, item, possible_total, summary
+from .core.scoring import (
+    SCORE_SPECS,
+    conclusion_label,
+    escalation_line,
+    item,
+    model_result,
+    possible_total,
+    summary,
+)
 from .core.storage import JsonStore
 
 PLUGIN_NAME = "astrbot_plugin_smart_request_review"
@@ -126,26 +132,45 @@ class SmartRequestReview(Star):
         self.seen_flags = {}
         self.list_snapshots = {}
         self._request_locks = {}
+        self._lock_limit = 5000
         self._blacklist_lock = asyncio.Lock()
-        self.providers = ProviderSelector(
-            context, config, Path(__file__).with_name("_conf_schema.json")
-        )
+        self.providers = ProviderSelector(context, config)
         self.renderer = ReviewCardRenderer()
-        self._provider_task = None
+        self._maintenance_task = None
         self._prune_state()
 
     async def initialize(self):
         self.providers.refresh()
-        self._provider_task = asyncio.create_task(self._late_provider_refresh())
+        self._maintenance_task = asyncio.create_task(self._maintenance())
 
-    async def _late_provider_refresh(self):
+    async def _maintenance(self):
+        """Refresh provider options once loaded, then keep runtime state bounded.
+
+        The delay gives AstrBot time to finish loading its providers; the loop
+        then prunes state that would otherwise grow for the whole uptime.
+        """
         await asyncio.sleep(8)
         self.providers.refresh()
+        while True:
+            await asyncio.sleep(600)
+            self._prune_state()
+            await asyncio.to_thread(self._prune_avatars)
+
+    def _prune_avatars(self):
+        """Drop cached avatars no longer referenced by any recent request."""
+        cutoff = time.time() - 30 * 86400
+        try:
+            for path in self.avatar_dir.glob("*.png"):
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+        except OSError as exc:
+            logger.debug(f"[{PLUGIN_NAME}] 清理头像缓存失败：{type(exc).__name__}")
 
     async def terminate(self):
-        if self._provider_task:
-            self._provider_task.cancel()
-            await asyncio.gather(self._provider_task, return_exceptions=True)
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+            await asyncio.gather(self._maintenance_task, return_exceptions=True)
+            self._maintenance_task = None
 
     def cfg(self, key, default=None):
         value = self.config.get(key, default)
@@ -176,15 +201,42 @@ class SmartRequestReview(Star):
         )
 
     def _prune_state(self):
+        """Drop expired or superseded runtime state.
+
+        History and blacklist sources are capped to the newest entries, and the
+        dedup flags, list snapshots and unused request locks are dropped once
+        they can no longer be referenced, so a long uptime cannot grow forever
+        and every state change keeps rewriting a bounded amount of JSON.
+        """
         self.pending = {
-            k: v
-            for k, v in self.pending.items()
-            if isinstance(v, dict) and not self._expired(v)
+            key: value
+            for key, value in self.pending.items()
+            if isinstance(value, dict) and not self._expired(value)
         }
-        self.seen_flags = {
-            k: t for k, t in self.seen_flags.items() if time.time() - t < 600
+        cutoff = time.time() - 600
+        self.seen_flags = {k: t for k, t in self.seen_flags.items() if t > cutoff}
+        self.list_snapshots = {
+            k: v for k, v in self.list_snapshots.items() if v[0] > cutoff
         }
+        limit = max(1, as_int(self.cfg("history_limit", 2000), 2000))
+        if len(self.history) > limit:
+            del self.history[: len(self.history) - limit]
+        sources = self.blacklist.get("sources")
+        if isinstance(sources, list) and len(sources) > limit:
+            del sources[: len(sources) - limit]
+        self._prune_locks()
         self._save_state()
+
+    def _prune_locks(self):
+        """Forget request locks that are neither held nor referenced any more."""
+        if len(self._request_locks) <= self._lock_limit:
+            return
+        referenced = set(self.seen_flags) | set(self.pending)
+        for key in list(self._request_locks):
+            if len(self._request_locks) <= self._lock_limit:
+                return
+            if key not in referenced and not self._request_locks[key].locked():
+                del self._request_locks[key]
 
     def _identity(self, event):
         try:
@@ -634,10 +686,6 @@ class SmartRequestReview(Star):
             "inviter_nickname": None,
             "comment": comment,
             "errors": [],
-            "notices": [],
-            "essence": [],
-            "members": [],
-            "honor": None,
             "raw": {},
         }
         info["avatar"] = await self._load_avatar("group", group_id)
@@ -921,11 +969,7 @@ class SmartRequestReview(Star):
             "action": "reject",
             "reason": "等待判断",
         }
-        suggestion = {"approve": "建议同意", "reject": "建议拒绝", "block": "建议拉黑"}[
-            conclusion["action"]
-        ]
-        if record.get("escalation") and record.get("status") == "pending":
-            suggestion = "需人工判断"
+        suggestion, _ = conclusion_label(record)
         p = record.get("profile") or record.get("group") or {}
 
         def name(key):
@@ -947,8 +991,9 @@ class SmartRequestReview(Star):
                 f"申请人：{name('nickname')}（QQ号 {self._display_id(p.get('user_id') or record.get('subject_id'))}）"
             )
         lines.append(f"{suggestion}：{conclusion['reason']}")
-        if record.get("escalation"):
-            lines.append("自动兜底：" + as_text(record["escalation"]))
+        escalation = escalation_line(record)
+        if escalation:
+            lines.append(escalation)
         approval_state = record.get("approval_state")
         if approval_state == "already_approved":
             lines.append("接口提示：此前已同意，本次按已同意处理")
@@ -1139,7 +1184,6 @@ class SmartRequestReview(Star):
             ):
                 return
             self.seen_flags[key] = time.time()
-            self.providers.refresh()
             comment = as_text(raw.get("comment"))
             if kind == "friend":
                 p = await self._friend_profile(self._event_bot(event), user_id, comment)
@@ -1205,6 +1249,8 @@ class SmartRequestReview(Star):
         await self._notify_requester(event, record, "已收到申请，等待管理员审核。")
 
     async def _finish_auto(self, event, record, approve, reason):
+        # The lock guards the blacklist read/update only: the approval call is
+        # network I/O and must not serialise every other request behind it.
         async with self._blacklist_lock:
             blocked = self._blacklist_reason(record)
             if blocked:
@@ -1215,12 +1261,10 @@ class SmartRequestReview(Star):
                     "local_blacklist": True,
                 }
                 record["recommendation"] = {"action": "reject", "reason": blocked}
-            ok, error = await self._approve(
-                self._event_bot(event), record, approve, reason
-            )
-            if ok:
-                effective_approve = self._effective_approve(record, approve)
-                self._on_success(record, effective_approve)
+        ok, error = await self._approve(self._event_bot(event), record, approve, reason)
+        if ok:
+            async with self._blacklist_lock:
+                self._on_success(record, self._effective_approve(record, approve))
         if not ok:
             self._persist_history(record, "error", error=error)
             await self._notify_reviewers(event, record, "审批接口失败", error)
@@ -1419,15 +1463,18 @@ class SmartRequestReview(Star):
             )
             approve = action == "同意"
             async with self._blacklist_lock:
-                if approve and self._blacklist_reason(record):
-                    yield event.plain_result(
-                        "申请对象已在黑名单中，不能同意；请引用消息拒绝。"
-                    )
-                    return
-                ok, error = await self._approve(
-                    self._event_bot(event), record, approve, reason
+                blocked = approve and bool(self._blacklist_reason(record))
+            if blocked:
+                yield event.plain_result(
+                    "申请对象已在黑名单中，不能同意；请引用消息拒绝。"
                 )
-                if ok:
+                return
+            # The approval is network I/O: run it without holding the lock.
+            ok, error = await self._approve(
+                self._event_bot(event), record, approve, reason
+            )
+            if ok:
+                async with self._blacklist_lock:
                     record["manual_reason"] = reason
                     effective_approve = self._effective_approve(record, approve)
                     self._on_success(

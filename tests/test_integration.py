@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -79,8 +80,12 @@ package = types.ModuleType("review_under_test")
 package.__path__ = [str(ROOT)]
 sys.modules["review_under_test"] = package
 plugin = importlib.import_module("review_under_test.main")
-from review_under_test.core.providers import ProviderSelector
-from review_under_test.core.scoring import model_result, possible_total, summary
+from review_under_test.core.scoring import (
+    SCORE_SPECS,
+    model_result,
+    possible_total,
+    summary,
+)
 from review_under_test.core.renderer import ReviewCardRenderer, lines_for
 
 
@@ -251,10 +256,6 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.p = plugin.SmartRequestReview(self.context, self.config)
-        self.p.providers.schema_path = self.data / "schema.json"
-        self.p.providers.schema_path.write_text(
-            '{"provider_id":{},"vision_provider_id":{}}', encoding="utf-8"
-        )
         self.p._download_image = AsyncMock(return_value=None)
         self.p.renderer = types.SimpleNamespace(
             render=lambda *a: b"image", render_list=lambda *a: b"image"
@@ -360,7 +361,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["comment"], "")
         self.assertIsNone(info["level"])
         self.assertIsNone(info["member_count"])
-        self.assertIsNone(info["honor"])
+        # the extension-only fields were removed with those queries
+        self.assertNotIn("honor", info)
+        self.assertNotIn("notices", info)
         scores = {v["key"]: v for v in record["items"]}
         self.assertEqual(set(scores), {"group_profile", "group_member"})
         for key in ("group_profile", "group_member"):
@@ -1398,6 +1401,92 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("99999", self.p.admin_users())
 
 
+    async def test_prune_caps_history_and_blacklist_sources(self):
+        self.config["history_limit"] = 5
+        self.p.history = [{"outcome": f"h{i}"} for i in range(12)]
+        self.p.blacklist["sources"] = [{"id": str(i)} for i in range(12)]
+        self.p._prune_state()
+        self.assertEqual(
+            [x["outcome"] for x in self.p.history], [f"h{i}" for i in range(7, 12)]
+        )
+        self.assertEqual(
+            [x["id"] for x in self.p.blacklist["sources"]],
+            [str(i) for i in range(7, 12)],
+        )
+        self.assertEqual(len(self.p.history_store.load()), 5)
+
+    async def test_prune_drops_unreferenced_locks_only(self):
+        self.p._lock_limit = 2
+        held = asyncio.Lock()
+        self.p._request_locks = {
+            "free": asyncio.Lock(),
+            "held": held,
+            "seen": asyncio.Lock(),
+        }
+        self.p.seen_flags = {"seen": time.time()}
+        await held.acquire()
+        try:
+            self.p._prune_locks()
+        finally:
+            held.release()
+        self.assertNotIn("free", self.p._request_locks)
+        self.assertIn("held", self.p._request_locks)
+        self.assertIn("seen", self.p._request_locks)
+
+    async def test_approval_runs_without_holding_the_blacklist_lock(self):
+        """Approvals are network I/O and must not serialise other requests."""
+        observed = []
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action in {"set_friend_add_request", "set_group_add_request"}:
+                observed.append(self.p._blacklist_lock.locked())
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("friend", flag="lock-manual")
+        await collect(self.p._handle_command(self.reply_event("拒绝"), "拒绝"))
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        await self.request("group", flag="lock-auto", comment="")
+        self.assertEqual(len(observed), 2)
+        self.assertFalse(any(observed))
+
+    async def test_requests_do_not_refresh_providers_each_time(self):
+        calls = []
+        original = self.p.providers.refresh
+
+        def spy():
+            calls.append(1)
+            return original()
+
+        self.p.providers.refresh = spy
+        self.p.providers.refresh()
+        calls.clear()
+        await self.request("friend", flag="no-per-request-refresh")
+        self.assertEqual(calls, [])
+
+    async def test_avatar_cache_is_pruned_by_age(self):
+        old, fresh = {"avatar": b"old-avatar"}, {"avatar": b"fresh-avatar"}
+        self.p._cache_avatar(old)
+        self.p._cache_avatar(fresh)
+        old_path = self.p.avatar_dir / (old["avatar_ref"] + ".png")
+        fresh_path = self.p.avatar_dir / (fresh["avatar_ref"] + ".png")
+        stale = time.time() - 40 * 86400
+        os.utime(old_path, (stale, stale))
+        self.p._prune_avatars()
+        self.assertFalse(old_path.exists())
+        self.assertTrue(fresh_path.exists())
+
+    async def test_maintenance_task_starts_and_is_cancelled(self):
+        await self.p.initialize()
+        task = self.p._maintenance_task
+        self.assertIsNotNone(task)
+        self.assertFalse(task.done())
+        await self.p.terminate()
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(self.p._maintenance_task)
+
+
 class UnitTests(unittest.TestCase):
     def test_schema_unique_and_defaults(self):
         def unique(pairs):
@@ -1431,6 +1520,65 @@ class UnitTests(unittest.TestCase):
             self.assertNotIn(removed, schema)
         for key in ("provider_id", "vision_provider_id"):
             self.assertEqual(schema[key]["_special"], "select_provider")
+
+    def test_schema_item_keys_match_score_specs(self):
+        """Every scored item has exactly one enable switch and one max score.
+
+        A stale key (or a missing one) means the config panel and the scoring
+        code disagree, which is how group_comment/group_level/group_text
+        leftovers survived a removal.
+        """
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        for kind, specs in SCORE_SPECS.items():
+            keys = {key for key, _, _ in specs}
+            expected = {
+                f"{key}_{suffix}" for key in keys for suffix in ("enabled", "max_score")
+            }
+            found = {
+                key
+                for key in schema
+                if key.startswith(f"{kind}_")
+                and key.endswith(("_enabled", "_max_score"))
+            }
+            self.assertEqual(found, expected)
+        prompts = {key for key in schema if key.endswith("_prompt")}
+        item_keys = {key for specs in SCORE_SPECS.values() for key, _, _ in specs}
+        self.assertLessEqual(prompts - {"decision_prompt"}, {f"{k}_prompt" for k in item_keys})
+
+    def test_readme_scoring_table_matches_specs(self):
+        """The README scoring table is parsed, not grepped, so it must be exact."""
+        lines = (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+        start = lines.index("| 对象 | 默认评分项 |")
+        rows = {}
+        for line in lines[start + 2 :]:  # skip the header and the separator
+            if not line.startswith("|"):
+                break
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            rows[cells[0]] = cells[1]
+        expected = {
+            label: "、".join(f"{name} {maximum}" for _, name, maximum in specs)
+            for label, specs in (("好友", SCORE_SPECS["friend"]), ("群邀请", SCORE_SPECS["group"]))
+        }
+        self.assertEqual(rows, expected)
+
+    def test_readme_totals_match_specs(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        friend_total = sum(maximum for _, _, maximum in SCORE_SPECS["friend"])
+        group_total = sum(maximum for _, _, maximum in SCORE_SPECS["group"])
+        totals_line = next(
+            (line for line in readme.splitlines() if line.startswith("每项可单独启用")),
+            "",
+        )
+        threshold_line = next(
+            (line for line in readme.splitlines() if "分别控制好友/群邀请" in line),
+            "",
+        )
+        self.assertIn(f"总分封顶 {min(10, friend_total)} 分", totals_line)
+        self.assertIn(f"群邀请启用项合计 {group_total} 分", totals_line)
+        self.assertIn(
+            f"群邀请默认 {schema['group_score_threshold']['default']}", threshold_line
+        )
 
     def test_summary_block_only_when_rejected(self):
         r = {

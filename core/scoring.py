@@ -22,6 +22,37 @@ SCORE_SPECS = {
     ],
 }
 
+# Single source for the conclusion vocabulary: the chat report and the card
+# renderer both print these, and the escalation override must not be re-derived
+# in two places (that is how the v1.1.8 "总分 0" text drifted out of date).
+ACTION_LABELS = {"approve": "建议同意", "reject": "建议拒绝", "block": "建议拉黑"}
+ACTION_COLORS = {"approve": "#087f5b", "reject": "#c23b40", "block": "#ad5e08"}
+MANUAL_LABEL = "需人工判断"
+MANUAL_COLOR = "#ad5e08"
+ESCALATION_PREFIX = "自动兜底："
+
+
+def conclusion_label(record: dict[str, Any]) -> tuple[str, str]:
+    """Return the (label, colour) for the conclusion line.
+
+    A pending card that auto mode could not judge must not present a
+    data-backed verdict, so it is labelled as needing a human instead; once a
+    reviewer has decided, the real conclusion is shown again.
+    """
+    if record.get("escalation") and record.get("status") == "pending":
+        return MANUAL_LABEL, MANUAL_COLOR
+    action = (record.get("recommendation") or {}).get("action", "reject")
+    return (
+        ACTION_LABELS.get(action, ACTION_LABELS["reject"]),
+        ACTION_COLORS.get(action, ACTION_COLORS["reject"]),
+    )
+
+
+def escalation_line(record: dict[str, Any]) -> str:
+    """Return the「自动兜底」line for an escalated record, or ""."""
+    note = as_text(record.get("escalation"))
+    return (ESCALATION_PREFIX + note) if note else ""
+
 
 def model_result(text: str, maximum: int) -> dict[str, Any]:
     raw = as_text(text).strip()
