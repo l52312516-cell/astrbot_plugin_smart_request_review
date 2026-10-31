@@ -907,6 +907,251 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r["score"], 0)
             self.assertEqual(r["state"], "unknown")
 
+    async def test_profile_retry_uses_good_aliases_and_never_placeholder_scores(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_stranger_info":
+                if params.get("no_cache"):
+                    return {
+                        "nickname": "原神玩家",
+                        "qq_level": 25,
+                        "long_nick": "动漫交流",
+                    }
+                return {
+                    "nickname": "unknown",
+                    "nick": "有效昵称",
+                    "qq_level": -1,
+                    "long_nick": "null",
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("friend", flag="profile-normalization", comment="\u200bNULL")
+        r = self.pending()
+        self.assertEqual(r["profile"]["nickname"], "有效昵称")
+        self.assertEqual(r["profile"]["level"], 25)
+        self.assertEqual(r["profile"]["signature"], "动漫交流")
+        self.assertEqual(r["profile"]["comment"], "")
+        scores = {entry["key"]: entry for entry in r["items"]}
+        self.assertEqual(scores["friend_verification"]["state"], "unknown")
+        self.assertEqual(scores["friend_content"]["state"], "unknown")
+        self.assertNotIn("申请人：unknown", self.p._report(r))
+
+    async def test_generic_verification_does_not_get_content_rule_points(self):
+        for comment in (
+            "你好！",
+            "我想加你为好友",
+            "aaaaaaaa",
+            "1234567",
+            "喜欢原神动漫希望交流",
+        ):
+            record = {
+                "kind": "friend",
+                "subject_id": "55555",
+                "profile": {"comment": comment},
+                "threshold": 5,
+                "hard_rule": {"action": "score"},
+            }
+            await self.p._score(self.event, record)
+            content = next(
+                entry for entry in record["items"] if entry["key"] == "friend_content"
+            )
+            self.assertEqual(content["state"], "scored")
+            self.assertEqual(content["score"], 1 if comment.startswith("喜欢") else 0)
+
+    async def test_group_prompt_keeps_real_description_and_announcement_without_nulls(
+        self,
+    ):
+        record = {
+            "kind": "group",
+            "subject_id": "55555",
+            "group": {
+                "name": "unknown",
+                "remark": "\u200b ",
+                "description": "火影忍者讨论",
+                "memo": "请先阅读交流群规",
+            },
+            "threshold": 3,
+            "hard_rule": {"action": "score"},
+        }
+        await self.p._score(self.event, record)
+        prompt = self.context.llm_generate.call_args.kwargs["prompt"]
+        self.assertIn("火影忍者讨论", prompt)
+        self.assertIn("请先阅读交流群规", prompt)
+        self.assertNotIn('"name":', prompt)
+        self.assertNotIn('"remark":', prompt)
+        self.assertNotIn("null", prompt)
+        self.assertIn("统一评分标准", prompt)
+        self.assertIn("可见", prompt)
+
+    async def test_invalid_numeric_profile_values_are_unknown(self):
+        for value in (True, 12.5, 0, -1, "unknown"):
+            for kind, key, fields in (
+                ("friend", "friend_level", {"level": value}),
+                ("group", "group_member", {"member_count": value}),
+            ):
+                record = {
+                    "kind": kind,
+                    "subject_id": "55555",
+                    "profile" if kind == "friend" else "group": fields,
+                    "threshold": 5,
+                    "hard_rule": {"action": "score"},
+                }
+                await self.p._score(self.event, record)
+                entry = next(entry for entry in record["items"] if entry["key"] == key)
+                self.assertEqual(entry["state"], "unknown", (kind, value))
+
+    async def test_unknown_score_that_can_change_result_requires_manual_review(self):
+        self.config.update(mode="auto", friend_score_threshold=5)
+        self.config["friend_avatar_enabled"] = False
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_stranger_info":
+                return {"nickname": "有效昵称", "qq_level": 15}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        self.context.llm_generate.return_value.completion_text = (
+            '{"score":1,"hit":true,"tags":[],"reason":"部分符合"}'
+        )
+        await self.request("friend", flag="unknown-can-change")
+        # Completed maximum is 7 >= threshold; a missing signature can still
+        # lift actual score 4 to 5. The old reachable-max test would reject.
+        record = self.pending()
+        self.assertEqual(record["score"], 4)
+        self.assertIn("可能改变通过结论", record["escalation"])
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(record["score_evidence"]["evaluated_max"], 7)
+
+    async def test_unknown_score_that_cannot_change_result_can_still_reject(self):
+        self.config.update(mode="auto", friend_score_threshold=5)
+        self.config["friend_avatar_enabled"] = False
+        self.context.llm_generate.return_value.completion_text = (
+            '{"score":0,"hit":false,"tags":[],"reason":"没有匹配特征"}'
+        )
+        await self.request("friend", flag="known-rejection")
+        self.assertEqual(len(self.approvals()), 1)
+        self.assertFalse(self.approvals()[0][1]["approve"])
+        self.assertEqual(self.p.pending, {})
+
+    async def test_no_enabled_items_has_zero_denominator_and_manual_fallback(self):
+        self.config["mode"] = "auto"
+        for key, _, _ in SCORE_SPECS["group"]:
+            self.config[key + "_enabled"] = False
+        await self.request("group", flag="all-disabled")
+        record = self.pending()
+        self.assertEqual(possible_total(record), 0)
+        self.assertEqual(record["score_evidence"]["enabled_max"], 0)
+        self.assertEqual(self.approvals(), [])
+
+    async def test_provider_resolver_failure_becomes_unknown(self):
+        self.p.providers.resolve = AsyncMock(side_effect=RuntimeError("unavailable"))
+        result = await self.p._model_score(
+            self.event, "friend_verification", "交流动漫", 3
+        )
+        self.assertEqual(result["state"], "unknown")
+
+    async def test_receipt_matching_rejects_conflicting_identity_and_ambiguity(self):
+        match = self.p._match_group_request_entry
+        base = {"group_id": 22222, "invitor_uin": 55555, "flag": "current"}
+        self.assertIsNone(
+            match([{**base, "group_id": 33333}], "22222", "55555", "current")
+        )
+        self.assertIsNone(
+            match([{**base, "invitor_uin": 66666}], "22222", "55555", "current")
+        )
+        legacy = {"group_id": 22222, "invitor_uin": 55555}
+        self.assertIsNone(match([legacy, dict(legacy)], "22222", "55555", "current"))
+        self.assertEqual(
+            match([{**base, "group_id": 33333}, legacy], "22222", "55555", "current"),
+            legacy,
+        )
+
+    async def test_explicit_rules_still_match_placeholder_request_text(self):
+        self.config.update(mode="auto", reject_keywords=["unknown"])
+        for kind in ("friend", "group"):
+            await self.request(
+                kind, flag="explicit-placeholder-" + kind, comment="unknown"
+            )
+        self.assertEqual(len(self.approvals()), 2)
+        self.assertTrue(all(not params["approve"] for _, params in self.approvals()))
+        self.assertTrue(
+            all(r["hard_rule"]["action"] == "reject" for r in self.p.history)
+        )
+
+    async def test_group_receipt_message_is_used_even_with_complete_group_profile(self):
+        self.config.update(mode="auto", reject_keywords=["广告"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_system_msg":
+                return [
+                    {
+                        "flag": "receipt-message",
+                        "group_id": 22222,
+                        "invitor_uin": 55555,
+                        "message": "发送广告邀请",
+                    }
+                ]
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="receipt-message", comment="")
+        self.assertEqual(len(self.approvals()), 1)
+        self.assertFalse(self.approvals()[0][1]["approve"])
+        self.assertEqual(self.p.history[-1]["group"]["comment"], "发送广告邀请")
+
+    async def test_duplicate_group_description_is_not_sent_as_two_evidences(self):
+        record = {
+            "kind": "group",
+            "subject_id": "55555",
+            "group": {"description": "动漫主题", "memo": "动漫主题"},
+            "threshold": 3,
+            "hard_rule": {"action": "score"},
+        }
+        await self.p._score(self.event, record)
+        prompt = self.context.llm_generate.call_args.kwargs["prompt"]
+        self.assertEqual(prompt.count("动漫主题"), 1)
+
+    async def test_actual_manual_result_is_distinguished_from_original_advice(self):
+        await self.request("friend", flag="manual-contradicts-advice")
+        record = self.pending()
+        self.assertEqual(record["recommendation"]["action"], "approve")
+        await collect(
+            self.p._handle_command(
+                self.reply_event("拒绝 审核员决定"), "拒绝", "审核员决定"
+            )
+        )
+        self.assertEqual(record["final_action"], "reject")
+        self.assertEqual(record["result"], "已拒绝")
+        report = self.p._report(record, record["result"])
+        self.assertIn("原审核建议：建议同意", report)
+        self.assertTrue(report.startswith("【好友申请】已拒绝"))
+        self.assertIn("人工理由：审核员决定", report)
+
+    async def test_group_conflicting_member_capacity_is_not_scored(self):
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_info":
+                return {
+                    "group_name": "交流群",
+                    "member_count": 600,
+                    "max_member_count": 500,
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="contradictory-capacity")
+        record = self.pending()
+        self.assertIsNone(record["group"]["member_count"])
+        entry = next(
+            entry for entry in record["items"] if entry["key"] == "group_member"
+        )
+        self.assertEqual(entry["state"], "unknown")
+
     async def test_provider_fallback_and_options(self):
         self.config.update(provider_id="vision", vision_provider_id="")
         self.config.schema = {"provider_id": {}, "vision_provider_id": {}}
@@ -1207,7 +1452,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.p.history[-1]["outcome"], "已同意（接口提示此前已同意）")
         self.assertIn("approval_note", self.p.history[-1])
 
-    async def test_group_already_agreed_when_auto_would_reject_is_not_failure(self):
+    async def test_group_already_agreed_on_reject_without_membership_is_failure(self):
         self.config["mode"] = "auto"
         self.config["group_blacklist"] = ["22222"]
         self.bot.already_agreed = True
@@ -1217,10 +1462,83 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.approvals()[0][1]["approve"])
         self.assertEqual(
             self.p.history[-1]["outcome"],
-            "已同意（接口提示此前已同意，原拒绝未执行）",
+            "error",
         )
         self.assertEqual(self.p.rejections, {})
-        self.assertNotIn("审批接口失败", str(self.p.history[-1]))
+        self.assertIn("already agree msg by self", self.p.history[-1]["error"])
+
+    async def test_group_reject_explicit_already_agreed_verifies_and_leaves(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+        attempted = False
+
+        async def call(action, **params):
+            nonlocal attempted
+            if action == "get_group_list":
+                return [{"group_id": 22222}] if attempted else []
+            if action == "set_group_add_request":
+                attempted = True
+                return {
+                    "status": "failed",
+                    "retcode": 1200,
+                    "msg": "already agree msg by self",
+                }
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="explicit-already-joined-reject")
+        self.assertTrue(any(a == "set_group_leave" for a, _ in self.bot.calls))
+        self.assertEqual(self.p.history[-1]["outcome"], "已拒绝（已入群，已退出群聊）")
+        self.assertEqual(self.p.rejections["group:55555"], 1)
+
+    async def test_group_reject_leave_failure_does_not_count_success(self):
+        self.config.update(mode="auto", group_blacklist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_list":
+                return [{"group_id": 22222}]
+            if action == "set_group_leave":
+                return {"status": "failed", "retcode": 100, "msg": "cannot leave"}
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="failed-leave")
+        self.assertEqual(self.p.history[-1]["outcome"], "error")
+        self.assertIn("cannot leave", self.p.history[-1]["error"])
+        self.assertEqual(self.p.rejections, {})
+
+    async def test_internal_1200_is_never_fabricated_as_approval(self):
+        self.config.update(mode="auto", group_allowlist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "set_group_add_request":
+                raise RuntimeError(
+                    "ActionFailed retcode=1200, wording='internal protocol error'"
+                )
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="generic-1200")
+        self.assertEqual(self.p.history[-1]["outcome"], "error")
+        self.assertNotIn("approval_state", self.p.history[-1])
+        self.assertEqual(self.p.rejections, {})
+
+    async def test_blacklist_added_during_membership_check_blocks_approval(self):
+        self.config.update(mode="auto", group_allowlist=["22222"])
+        original = self.bot.call_action
+
+        async def call(action, **params):
+            if action == "get_group_list":
+                self.p._add_blacklist("groups", "22222", "在查询期间被踢")
+                return []
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        await self.request("group", flag="blacklist-during-query")
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.p.history[-1]["outcome"], "error")
 
     async def test_auto_reject_leaves_group_when_already_joined(self):
         self.config.update(mode="auto", group_blacklist=["22222"])
@@ -1557,7 +1875,6 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await collect(self.p._manage_reviewer(event, False))
         self.assertNotIn("99999", self.p.admin_users())
 
-
     async def test_prune_caps_history_and_blacklist_sources(self):
         self.config["history_limit"] = 5
         self.p.history = [{"outcome": f"h{i}"} for i in range(12)]
@@ -1700,7 +2017,9 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(found, expected)
         prompts = {key for key in schema if key.endswith("_prompt")}
         item_keys = {key for specs in SCORE_SPECS.values() for key, _, _ in specs}
-        self.assertLessEqual(prompts - {"decision_prompt"}, {f"{k}_prompt" for k in item_keys})
+        self.assertLessEqual(
+            prompts - {"decision_prompt"}, {f"{k}_prompt" for k in item_keys}
+        )
 
     def test_readme_scoring_table_matches_specs(self):
         """The README scoring table is parsed, not grepped, so it must be exact."""
@@ -1714,7 +2033,10 @@ class UnitTests(unittest.TestCase):
             rows[cells[0]] = cells[1]
         expected = {
             label: "、".join(f"{name} {maximum}" for _, name, maximum in specs)
-            for label, specs in (("好友", SCORE_SPECS["friend"]), ("群邀请", SCORE_SPECS["group"]))
+            for label, specs in (
+                ("好友", SCORE_SPECS["friend"]),
+                ("群邀请", SCORE_SPECS["group"]),
+            )
         }
         self.assertEqual(rows, expected)
 

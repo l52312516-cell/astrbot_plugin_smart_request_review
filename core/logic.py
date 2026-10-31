@@ -16,7 +16,7 @@ def as_text(value: Any, default: str = "") -> str:
 def as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -56,7 +56,7 @@ def contains_any(text: str, values: Any) -> list[str]:
 def clamp_score(value: Any, maximum: int) -> int:
     try:
         score = int(round(float(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return max(0, min(maximum, score))
 
@@ -99,6 +99,42 @@ def score_range(value: Any, minimum: int, maximum: int, points: int) -> int:
     if minimum <= number <= maximum:
         return max(0, points)
     return 0
+
+
+def specific_content(value: Any) -> bool:
+    """Reward usable request text, not empty greetings or character padding.
+
+    This only measures whether there is content to review; it never claims
+    that the supplied identity, purpose, or statements are truthful.
+    """
+    from .profiles import clean_text
+
+    text = "".join(c for c in clean_text(value).casefold() if c.isalnum())
+    if len(text) < 4 or len(set(text)) < 2 or text.isdigit():
+        return False
+    generic = {
+        "你好",
+        "您好",
+        "你好啊",
+        "你好呀",
+        "添加好友",
+        "请求添加好友",
+        "我想添加你为好友",
+        "我想加你为好友",
+        "加个好友",
+        "加我好友",
+        "请通过",
+        "请通过一下",
+        "请同意",
+        "通过一下",
+        "helloworld",
+        "hello",
+        "hi",
+        "加一下",
+        "申请通过",
+        "好友申请",
+    }
+    return text not in generic
 
 
 def format_value(value: Any, fallback: str = "未知") -> str:

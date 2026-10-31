@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from .profiles import meaningful
+from .profiles import clean_text, meaningful, profile_value
 from .scoring import (
     MANUAL_COLOR,
     conclusion_label,
@@ -32,6 +32,8 @@ def font(size: int):
 def text_value(value: Any) -> str:
     if value is None or value == "" or value == [] or value == {}:
         return "未知"
+    if isinstance(value, str):
+        return clean_text(value) or "未知"
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
@@ -41,6 +43,7 @@ def lines_for(value, width, size=25, max_lines=3):
     """Pixel-measured wrapping works for Chinese, emoji and long unbroken IDs."""
     face = font(size)
     text = text_value(value).replace("\r", "").replace("\t", " ")[:6000]
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     lines, line = [], ""
     for char in text:
         if char == "\n" or face.getlength(line + char) > width:
@@ -76,54 +79,61 @@ class ReviewCardRenderer:
 
         kind = record["kind"]
         p = record.get("profile") or record.get("group") or {}
-        fields = (
-            [
-                ("QQ", p.get("user_id")),
-                ("昵称", p.get("nickname")),
-                ("QQ等级", p.get("level")),
-                (
-                    "性别 / 地区",
-                    " / ".join(
-                        str(p[k])
-                        for k in ("sex", "area")
-                        if meaningful(p.get(k)) and p[k] != "unknown"
-                    ),
-                ),
-                ("签名", p.get("signature")),
-                ("验证信息", p.get("comment")),
+        if kind == "friend":
+            sex = profile_value(p, "sex")
+            sex = {"male": "男", "female": "女"}.get(
+                str(sex).casefold(), "" if sex is None else str(sex)
+            )
+            area = clean_text(profile_value(p, "area", default=""))
+            location = " / ".join(value for value in (sex, area) if value)
+            fields = [
+                ("QQ", profile_value(p, "user_id")),
+                ("昵称", profile_value(p, "nickname", "nick", "name")),
+                ("QQ等级", profile_value(p, "level", "qq_level", "qqLevel")),
+                ("性别 / 地区", location),
+                ("签名", profile_value(p, "signature", "long_nick", "longNick")),
+                ("验证信息", profile_value(p, "comment", "message")),
             ]
-            if kind == "friend"
-            else [
-                ("群号", p.get("group_id")),
-                ("群名称", p.get("name")),
-                ("群备注", p.get("remark")),
-                (
-                    "人数 / 上限",
-                    (
-                        str(p["member_count"])
-                        if meaningful(p.get("member_count"))
-                        else ""
-                    )
-                    + (
-                        f" / {p['max_member_count']}"
-                        if meaningful(p.get("member_count"))
-                        and meaningful(p.get("max_member_count"))
-                        else ""
-                    ),
-                ),
-                ("群等级", p.get("level")),
-                (
-                    "邀请人",
-                    f"{p.get('inviter_nickname') or ''} ({p.get('inviter_id') or record.get('subject_id') or ''})".strip(),
-                ),
-                ("验证信息", p.get("comment")),
-                ("群简介", p.get("memo")),
+        else:
+            count = profile_value(p, "member_count")
+            maximum = profile_value(p, "max_member_count")
+            count_label = "人数 / 上限" if count and maximum else "群人数"
+            count_text = f"{count} / {maximum}" if count and maximum else count
+            if not count and maximum:
+                count_label, count_text = "人数上限", maximum
+            inviter_name = clean_text(profile_value(p, "inviter_nickname", default=""))
+            inviter_id = clean_text(
+                profile_value(p, "inviter_id", default=record.get("subject_id", ""))
+            )
+            inviter = ""
+            if inviter_name and inviter_id:
+                inviter = f"{inviter_name}（QQ {inviter_id}）"
+            elif inviter_name:
+                inviter = inviter_name
+            elif inviter_id:
+                inviter = f"QQ {inviter_id}"
+            description = profile_value(p, "description", "group_description")
+            memo = profile_value(p, "memo", "group_memo", "groupMemo")
+            fields = [
+                ("群号", profile_value(p, "group_id")),
+                ("群名称", profile_value(p, "name", "group_name", "groupName")),
+                ("群备注", profile_value(p, "remark", "group_remark", "groupRemark")),
+                (count_label, count_text),
+                ("群等级", profile_value(p, "level", "group_level", "groupLevel")),
+                ("邀请人", inviter),
+                ("验证信息", profile_value(p, "comment", "message")),
+                ("群简介", description or memo),
+                ("群公告", memo if description and memo != description else None),
             ]
-        )
         section("申请资料")
+        seen_fields = set()
         for label, value in fields:
             if meaningful(value):
-                add(f"{label}：{text_value(value)}", max_lines=2)
+                rendered = text_value(value)
+                if label in {"群备注", "群简介", "群公告"} and rendered in seen_fields:
+                    continue
+                seen_fields.add(rendered)
+                add(f"{label}：{rendered}", max_lines=2)
         section("审核依据")
         add(
             "硬规则：" + str(record.get("hard_rule", {}).get("reason", "未知")),
@@ -134,6 +144,22 @@ class ReviewCardRenderer:
             "score_raw", record.get("score", 0)
         )
         items = record.get("items", [])
+        active = [
+            entry
+            for entry in items
+            if entry.get("state") != "disabled" and entry.get("max", 0) > 0
+        ]
+        evidence = record.get("score_evidence") or {}
+        if evidence.get("enabled_max", 0) > 0 and any(
+            entry.get("state") in {"scored", "unknown"} for entry in active
+        ):
+            coverage = max(0, min(1, evidence.get("coverage", 0)))
+            add(
+                f"有效评分依据 {evidence.get('evaluated_max', 0)} / {evidence['enabled_max']}（{coverage:.0%}）",
+                24,
+                "#536273",
+                1,
+            )
         skipped = any(x.get("state") == "skipped" for x in items) and all(
             x.get("state") in {"skipped", "disabled"} for x in items
         )
@@ -141,14 +167,18 @@ class ReviewCardRenderer:
             (
                 "评分未执行 · 硬规则决定结果"
                 if skipped
-                else f"总分  {total} / {possible_total(record)}     通过阈值  {record.get('threshold', 5)}"
+                else (
+                    "无启用评分项"
+                    if not active
+                    else f"总分  {total} / {possible_total(record)}     通过阈值  {record.get('threshold', 5)}"
+                )
             ),
             34,
             "#173f68",
             2,
         )
-        if not skipped:
-            addition = " + ".join(str(x["score"]) for x in items)
+        if not skipped and active:
+            addition = " + ".join(str(x["score"]) for x in active)
             add(
                 f"{addition} = {raw}" + ("，封顶后为 10 分" if raw > 10 else " 分"),
                 23,
@@ -187,12 +217,13 @@ class ReviewCardRenderer:
             "reason": "待判断",
         }
         label, color = conclusion_label(record)
-        section("最终结论")
+        section("原审核建议" if record.get("status") == "processed" else "审核建议")
         add(f"{label}：{conclusion['reason']}", 32, color, 3)
         escalation = escalation_line(record)
         if escalation:
             add(escalation, 26, MANUAL_COLOR, 3)
         if outcome != "待审批":
+            section("最终处理结果")
             add("执行结果：" + outcome, 29, "#224c77", 2)
         else:
             add(
@@ -252,9 +283,21 @@ class ReviewCardRenderer:
         selected = entries
         rows = []
         for index, entry in enumerate(selected, start_index + 1):
-            ident = entry.get("group_id") or entry.get("user_id") or "未知"
-            name = entry.get("group_name") or entry.get("nickname") or "未知"
-            rows.append((f"{index}.  {ident}", lines_for(name, 710, 25, 2)))
+            ident = profile_value(entry, "group_id", "user_id", default="")
+            name = profile_value(
+                entry,
+                "group_name",
+                "nickname",
+                "remark",
+                "group_remark",
+                default="",
+            )
+            rows.append(
+                (
+                    f"{index}.  {ident}" if meaningful(ident) else f"{index}.",
+                    lines_for(name, 710, 25, 2) if meaningful(name) else [],
+                )
+            )
         height = 172 + sum(max(80, len(name) * 38 + 22) for _, name in rows)
         canvas = Image.new("RGB", (1120, height), "#f1f6fb")
         draw = ImageDraw.Draw(canvas)
