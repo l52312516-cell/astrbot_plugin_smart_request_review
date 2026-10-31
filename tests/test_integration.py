@@ -331,7 +331,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "group_id": 22222,
                             "request_id": 123,
-                            "invitor_uin": 55555,
+                            "invitor_uin": 66666,
                             "invitor_nick": "邀请者",
                             "group_name": "收件箱群名",
                             "message": "旧验证内容",
@@ -378,13 +378,150 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         original = self.bot.call_action
 
         async def call(action, **params):
-            if action == "get_group_info" and not params.get("no_cache"):
+            if action == "get_group_info":
                 return {"group_name": "", "member_count": 0}
+            if action in {"get_group_system_msg", "get_group_ignored_notifies"}:
+                return []
             return await original(action, **params)
 
         self.bot.call_action = call
         info = await self.p._group_info(self.bot, "22222", "55555", "F1", "")
         self.assertIsNone(info["name"])
+
+    async def test_group_no_cache_retry_recovers_public_group_fields(self):
+        original = self.bot.call_action
+        calls = []
+
+        async def call(action, **params):
+            if action == "get_group_info":
+                calls.append(params)
+                if params.get("no_cache"):
+                    return {
+                        "group_name": "公开动漫群",
+                        "member_count": 88,
+                        "max_member_count": 500,
+                    }
+                return {"group_name": "", "member_count": 0}
+            if action in {"get_group_system_msg", "get_group_ignored_notifies"}:
+                return []
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        info = await self.p._group_info(self.bot, "22222", "55555", "F1", "")
+        self.assertEqual(info["name"], "公开动漫群")
+        self.assertEqual(info["member_count"], 88)
+        self.assertEqual(info["max_member_count"], 500)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[1]["no_cache"])
+
+    async def test_group_request_receipt_fills_matching_name(self):
+        original = self.bot.call_action
+        calls = []
+
+        async def call(action, **params):
+            if action == "get_group_system_msg":
+                calls.append(params)
+            if action == "get_group_info":
+                return {"group_name": "", "member_count": 0}
+            if action == "get_stranger_info":
+                return {}
+            if action == "get_group_system_msg":
+                return {
+                    "invited_requests": [
+                        {
+                            "group_id": 22222,
+                            "invitor_uin": 55555,
+                            "invitor_nick": "收件箱邀请人",
+                            "group_name": "收件箱公开群",
+                        }
+                    ]
+                }
+            if action == "get_group_ignored_notifies":
+                return []
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        info = await self.p._group_info(self.bot, "22222", "55555", "F1", "")
+        self.assertEqual(info["name"], "收件箱公开群")
+        self.assertEqual(info["inviter_nickname"], "收件箱邀请人")
+        self.assertEqual(
+            calls[0], {"group_id": 22222, "only_pending": True, "count": 50}
+        )
+
+    async def test_snowluma_group_list_recovers_profile(self):
+        original = self.bot.call_action
+        calls = []
+
+        async def call(action, **params):
+            if action == "get_group_info":
+                return {"group_name": "", "member_count": 0}
+            if action == "get_group_list":
+                calls.append(params)
+                return [
+                    {
+                        "group_id": 22222,
+                        "group_name": "SnowLuma 群资料",
+                        "group_description": "公开讨论",
+                        "member_count": 76,
+                        "max_member_count": 500,
+                        "group_level": 4,
+                    }
+                ]
+            return await original(action, **params)
+
+        self.bot.call_action = call
+        info = await self.p._group_info(self.bot, "22222", "55555", "F1", "")
+        self.assertEqual(calls, [{"no_cache": True}])
+        self.assertEqual(info["name"], "SnowLuma 群资料")
+        self.assertEqual(info["memo"], "公开讨论")
+        self.assertEqual(info["member_count"], 76)
+        self.assertEqual(info["max_member_count"], 500)
+        self.assertEqual(info["level"], 4)
+
+    async def test_receipt_flag_mismatch_does_not_fall_back_to_other_request(self):
+        entries = [
+            {
+                "group_id": 22222,
+                "invitor_uin": 55555,
+                "flag": "slreq:1:older:22222:group_invite:false",
+                "group_name": "旧申请群名",
+            }
+        ]
+        self.assertIsNone(
+            self.p._match_group_request_entry(
+                entries,
+                "22222",
+                "55555",
+                "slreq:1:current:22222:group_invite:false",
+            )
+        )
+        self.assertEqual(
+            self.p._match_group_request_entry(
+                [{**entries[0], "flag": ""}], "22222", "55555", "current"
+            )["group_name"],
+            "旧申请群名",
+        )
+
+    async def test_receipt_parser_supports_nested_napcat_containers(self):
+        entries = self.p._group_request_entries(
+            {"data": {"InvitedRequest": [{"group_id": 22222}]}, "join_requests": []}
+        )
+        self.assertEqual(entries, [{"group_id": 22222}])
+
+    async def test_group_invite_targets_only_invited_bot(self):
+        raw = {
+            "request_type": "group",
+            "sub_type": "invite",
+            "user_id": "55555",
+            "group_id": "22222",
+            "flag": "targeted",
+            "invited_id": "54321",
+        }
+        await self.p._process_request(self.event, raw)
+        self.assertEqual(self.bot.calls, [])
+        raw["invited_id"] = "12345"
+        await self.p._process_request(self.event, raw)
+        self.assertEqual(len(self.p.pending), 1)
 
     async def test_relationship_api_parameters_and_score_sources(self):
         original = self.bot.call_action
@@ -619,6 +756,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(calls[0].get("no_cache"))
 
+    async def test_stranger_fields_support_snowluma_qq_level_alias(self):
+        self.assertEqual(
+            self.p._stranger_fields({"nickname": "SnowLuma", "qq_level": 18}),
+            ("SnowLuma", 18, None),
+        )
+
     async def test_auto_no_data_escalates_to_manual(self):
         """A group the bot has not joined returns no profile; do not auto-reject it."""
         self.config.update(mode="auto", group_score_threshold=6)
@@ -657,21 +800,33 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.approvals(), [])
         self.assertEqual(self.pending()["status"], "pending")
 
-    async def test_auto_real_zero_scores_still_rejected(self):
-        """Fully available data scored at 0 is a verdict, not missing data."""
+    async def test_auto_real_zero_scores_escalate_to_manual(self):
+        """A zero total in auto mode requires a reviewer when no hard rule hit."""
         self.config.update(mode="auto", group_score_threshold=4)
         self.context.llm_generate.return_value = types.SimpleNamespace(
             completion_text='{"score":0,"hit":false,"tags":[],"reason":"不符合"}'
         )
+        self.config["group_member_min"] = 999
         await self.request("group", flag="scored-zero", comment="随便加一下")
-        self.assertEqual(self.p.pending, {})
-        approvals = self.approvals()
-        self.assertEqual(len(approvals), 1)
-        self.assertFalse(approvals[0][1]["approve"])
-        self.assertEqual(self.p.history[-1]["outcome"], "已拒绝")
-        states = {x["key"]: x["state"] for x in self.p.history[-1]["items"]}
+        self.assertEqual(self.approvals(), [])
+        record = self.pending()
+        self.assertEqual(record["status"], "pending")
+        self.assertIn("自动评分结果为 0 分", record["escalation"])
+        states = {x["key"]: x["state"] for x in record["items"]}
         self.assertEqual(states["group_profile"], "scored")
         self.assertEqual(states["group_member"], "scored")
+
+    async def test_auto_zero_score_at_zero_threshold_still_escalates(self):
+        self.config.update(mode="auto", group_score_threshold=0)
+        self.config["group_member_min"] = 999
+        self.context.llm_generate.return_value.completion_text = (
+            '{"score":0,"hit":false,"tags":[],"reason":"未发现特征"}'
+        )
+        await self.request("group", flag="zero-score-zero-threshold")
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.pending()["score"], 0)
+        self.assertEqual(self.pending()["status"], "pending")
+        self.assertIn("自动评分结果为 0 分", self.pending()["escalation"])
 
     async def test_auto_sparse_profile_escalates_to_manual(self):
         """Friend verification text always arrives with the event, so that total is
@@ -686,7 +841,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.bot.call_action = call
         for kind, expected, note in (
-            ("group", 0, "0/2 项完成评分，可得最高分 0 < 通过阈值 5"),
+            ("group", 0, "自动评分结果为 0 分（0/2 项完成评分）"),
             ("friend", 3, "2/6 项完成评分，可得最高分 4 < 通过阈值 5"),
         ):
             await self.request(kind, flag=f"sparse-{kind}", comment="一起交流")
@@ -702,7 +857,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.approvals(), [])
 
     async def test_auto_hard_rule_still_executes_without_data(self):
-        self.config.update(mode="auto", group_blacklist=["22222"])
+        self.config.update(
+            mode="auto", group_score_threshold=0, group_blacklist=["22222"]
+        )
         original = self.bot.call_action
 
         async def call(action, **params):

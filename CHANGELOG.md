@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.17 - 2026-10-31
+
+- 适配 SnowLuma 可用的 OneBot 字段与 action：陌生人等级兼容 `qq_level`，群资料缺失时补查 `get_group_list(no_cache=True)`。
+- 群邀请收件箱查询传入 `group_id`、`only_pending`、`count`，兼容 SnowLuma 数组和 NapCat 嵌套容器；规范 flag 不匹配时不再误用其它申请。
+- 利用群邀请事件的 `invited_id` 校验目标机器人，避免多 OneBot 账号重复处理。
+- 全自动评分总分为 0 时优先转人工，即使通过阈值配置为 0。
+- 新增 SnowLuma 字段、收件箱匹配、多账号和零分边界回归测试。
+
+## 1.1.16 - 2026-10-31
+
+- 修复群邀请资料偶发为空的问题：`get_group_info` 返回空壳或字段不完整时使用 `no_cache=True` 重试。
+- 当标准群接口仍缺少群名时，按 `flag` 或群号＋邀请人精确匹配 `get_group_system_msg` / `get_group_ignored_notifies`，补充可靠的收件箱资料，避免使用其它申请的群信息。
+- 全自动模式下，评分总分为 0 且未命中硬规则时转人工审核（即使阈值为 0）；黑名单和拒绝关键词等硬规则保持原有自动处理。
+- 按 SnowLuma 的 OneBot action 契约补充 `get_group_system_msg(group_id, only_pending, count)` 查询、`get_group_list(no_cache)` 补全和 `qq_level` 等级别名；群邀请严格校验 `invited_id` 与 `flag`，避免多账号或旧收件箱记录误处理。
+- 零分转人工优先于阈值判断，阈值设为 0 时也不会因空资料自动通过。
+- 增加群资料重试、收件箱匹配和总分 0 转人工回归测试。
+
 ## 1.1.15 - 2026-10-06
 
 - README 只保留当前版本说明，历史版本记录统一由 `CHANGELOG.md` 承担。此前每版说明都前置到 README，导致真正的开篇介绍被压到中段，现已把介绍移到标题下。

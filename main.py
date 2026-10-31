@@ -616,7 +616,9 @@ class SmartRequestReview(Star):
         """The three stranger fields the review actually scores."""
         return (
             first_value(raw, "nickname", "nick", "name", default=None),
-            first_value(raw, "qqLevel", "level", "qlevel", default=None),
+            first_value(
+                raw, "qq_level", "qqLevel", "level", "qlevel", default=None
+            ),
             first_value(
                 raw, "long_nick", "longNick", "long_nickname", "signature", default=None
             ),
@@ -674,11 +676,13 @@ class SmartRequestReview(Star):
         return profile
 
     async def _group_info(self, bot, group_id, inviter_id, flag, comment):
-        """Collect the same request context as astrbot_plugin_relationship.
+        """Collect group data while accounting for unjoined-group API limits.
 
-        The request itself only has inviter/group IDs.  The reliable sources are
-        the standard stranger and group APIs; inbox/system-message APIs are not
-        used because they may contain stale or unrelated requests.
+        ``get_group_info`` can return a successful empty shell before the bot has
+        joined a public group.  Retry without the adapter cache, then use a
+        precisely matched request-inbox entry for the group name when available.
+        Unmatched inbox entries are ignored so an older request cannot leak data
+        into the current review.
         """
         info = {
             "group_id": group_id,
@@ -702,18 +706,105 @@ class SmartRequestReview(Star):
             )
         if not meaningful(info.get("inviter_nickname")):
             info["inviter_nickname"] = None
-            info["errors"].append("邀请人昵称未提供" + (f"：{error}" if error else ""))
+            original_inviter = inviter if ok and isinstance(inviter, dict) else {}
+            retry_ok, retry, retry_error = await self._call(
+                bot, "get_stranger_info", user_id=int(inviter_id), no_cache=True
+            )
+            if retry_ok and isinstance(retry, dict):
+                info["raw"]["get_stranger_info_no_cache"] = retry
+                info["inviter_nickname"] = first_value(
+                    retry, "nickname", "nick", "name", default=None
+                )
+            if not meaningful(info.get("inviter_nickname")):
+                info["inviter_nickname"] = None
+                detail = retry_error or error
+                info["errors"].append(
+                    "邀请人昵称未提供" + (f"：{detail}" if detail else "")
+                )
 
         ok, data, error = await self._call(
             bot, "get_group_info", group_id=int(group_id)
         )
+        group_error = error
         if ok and isinstance(data, dict):
             info["raw"]["get_group_info"] = data
             merge_group(info, data)
-        else:
-            info["errors"].append(
-                "get_group_info：" + (error or "返回资料为空或格式不正确")
+
+        if self._group_data_incomplete(info):
+            retry_ok, retry, retry_error = await self._call(
+                bot, "get_group_info", group_id=int(group_id), no_cache=True
             )
+            if retry_ok and isinstance(retry, dict):
+                info["raw"]["get_group_info_no_cache"] = retry
+                merge_group(info, retry)
+                group_error = ""
+            elif retry_error:
+                group_error = retry_error
+
+        # Some OneBot implementations expose a fresher roster record than the
+        # per-group detail endpoint (especially while a group request is being
+        # processed).  SnowLuma documents the same fields on get_group_list;
+        # use it only when the detail response is still incomplete.
+        if self._group_data_incomplete(info):
+            list_ok, group_list, list_error = await self._call(
+                bot, "get_group_list", no_cache=True
+            )
+            if list_ok and isinstance(group_list, list):
+                for candidate in group_list:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_id = first_value(
+                        candidate, "group_id", "groupId", default=None
+                    )
+                    if as_text(candidate_id) == str(group_id):
+                        info["raw"]["get_group_list"] = candidate
+                        merge_group(info, candidate)
+                        break
+            elif list_error:
+                info["errors"].append("get_group_list：" + list_error)
+
+        if self._group_data_incomplete(info):
+            receipt = await self._group_request_receipt(
+                bot, group_id, inviter_id, flag
+            )
+            if receipt:
+                info["raw"]["group_request_receipt"] = receipt
+                merge_group(
+                    info,
+                    {
+                        "group_name": first_value(
+                            receipt, "group_name", "groupName", "name", default=None
+                        ),
+                        "group_remark": first_value(
+                            receipt,
+                            "group_remark",
+                            "groupRemark",
+                            "remark",
+                            default=None,
+                        ),
+                        "group_memo": first_value(
+                            receipt,
+                            "group_description",
+                            "group_memo",
+                            "groupMemo",
+                            "memo",
+                            default=None,
+                        ),
+                    },
+                )
+                if not meaningful(info.get("inviter_nickname")):
+                    info["inviter_nickname"] = first_value(
+                        receipt,
+                        "invitor_nick",
+                        "inviter_nick",
+                        "requester_nick",
+                        default=None,
+                    )
+
+        if group_error:
+            info["errors"].append("get_group_info：" + group_error)
+        elif self._group_data_incomplete(info):
+            info["errors"].append("get_group_info：返回资料为空或字段不完整")
 
         for key, label in (
             ("name", "群名"),
@@ -727,6 +818,117 @@ class SmartRequestReview(Star):
         if not info["avatar"]:
             info["errors"].append("群头像下载失败")
         return info
+
+    @staticmethod
+    def _group_data_incomplete(info):
+        """Whether the standard group response still lacks useful fields."""
+        has_profile = any(
+            meaningful(info.get(key)) for key in ("name", "remark", "memo")
+        )
+        return not has_profile or not meaningful(info.get("member_count"))
+
+    async def _group_request_receipt(self, bot, group_id, inviter_id, flag):
+        """Find this invite in OneBot's request inbox, if the adapter exposes it."""
+        # SnowLuma implements the standard action with these filters.  Keep a
+        # no-argument fallback for NapCat/older OneBot adapters that expose a
+        # different request-inbox shape.
+        queries = (
+            {"group_id": int(group_id), "only_pending": True, "count": 50},
+            {"group_id": int(group_id), "only_pending": False, "count": 50},
+            {},
+        )
+        for action in ("get_group_system_msg", "get_group_ignored_notifies"):
+            for params in queries:
+                if action == "get_group_ignored_notifies" and params:
+                    continue
+                ok, data, _ = await self._call(bot, action, **params)
+                if not ok:
+                    continue
+                entries = self._group_request_entries(data)
+                match = self._match_group_request_entry(
+                    entries, str(group_id), str(inviter_id), str(flag or "")
+                )
+                if match is not None:
+                    match = dict(match)
+                    match["source"] = action
+                    return match
+        return None
+
+    @staticmethod
+    def _group_request_entries(data):
+        entries = []
+        containers = {
+            "invited_requests",
+            "InvitedRequest",
+            "group_invites",
+            "requests",
+            "join_requests",
+            "notifications",
+            "data",
+        }
+
+        def visit(value):
+            if isinstance(value, list):
+                for item in value:
+                    visit(item)
+            elif isinstance(value, dict):
+                # A dict with group/request fields is itself a record.  Do not
+                # recurse into its scalar fields, but keep nested NapCat data.
+                if any(
+                    key in value
+                    for key in (
+                        "group_id",
+                        "groupId",
+                        "request_id",
+                        "requestId",
+                        "flag",
+                    )
+                ):
+                    entries.append(value)
+                for key in containers:
+                    if key in value:
+                        visit(value[key])
+
+        visit(data)
+        return entries
+
+    @staticmethod
+    def _match_group_request_entry(entries, group_id, inviter_id, flag):
+        def value(entry, *keys):
+            return next(
+                (as_text(entry.get(key)) for key in keys if meaningful(entry.get(key))),
+                "",
+            )
+
+        if flag:
+            for entry in entries:
+                if value(entry, "flag") == flag:
+                    return entry
+            # Canonical SnowLuma/NapCat records carry a flag.  Older adapters
+            # may omit it entirely; retain the group+inviter fallback only for
+            # that legacy shape, never when another flag is present.
+            if any(value(entry, "flag") for entry in entries):
+                return None
+        same_group = [
+            entry
+            for entry in entries
+            if value(entry, "group_id", "groupId") == group_id
+        ]
+        for entry in same_group:
+            if value(
+                entry,
+                "invitor_uin",
+                "invitor_id",
+                "inviter_id",
+                "inviter_uin",
+                "requester_id",
+                "requester_uin",
+                "user_id",
+            ) == inviter_id:
+                return entry
+        # Without an inviter in the event, the first same-group entry is the
+        # only safe compatibility fallback.  With an inviter, do not guess.
+        return same_group[0] if same_group and not inviter_id else None
 
     def _item_cfg(self, key, maximum):
         return bool(self.cfg(f"{key}_enabled", True)), max(
@@ -1132,6 +1334,13 @@ class SmartRequestReview(Star):
         scored = [x for x in items if x.get("state") == "scored"]
         reachable = sum(int(x.get("max", 0)) for x in scored)
         threshold = int(record.get("threshold", 0))
+        if int(record.get("score", 0)) == 0:
+            return (
+                f"自动评分结果为 0 分（{len(scored)}/{len(items)} 项完成评分），"
+                "转人工判断"
+            )
+        if threshold <= 0:
+            return ""
         if reachable >= threshold:
             return ""
         return (
@@ -1159,6 +1368,13 @@ class SmartRequestReview(Star):
         ):
             return
         bot_id, platform_id = self._identity(event)
+        # SnowLuma includes the target account in group invite events. With
+        # multiple OneBot accounts, only the addressed account handles it.
+        invited_id = raw.get("invited_id") or raw.get("invited_uin")
+        if invited_id not in (None, "", 0, "0") and (
+            not bot_id or str(invited_id) != str(bot_id)
+        ):
+            return
         logger.info(
             f"[{PLUGIN_NAME}] 收到{kind}申请：bot={bot_id}, platform={platform_id}"
         )
@@ -1220,7 +1436,7 @@ class SmartRequestReview(Star):
                     action == "score" and record["score"] >= record["threshold"]
                 )
                 fallback = self._manual_fallback_reason(record)
-                if not approve and fallback:
+                if fallback and (not approve or int(record.get("score", 0)) == 0):
                     record["escalation"] = fallback
                     await self._queue_pending(event, record)
                     return
